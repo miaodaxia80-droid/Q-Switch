@@ -119,6 +119,22 @@ cargo clippy --manifest-path src-tauri/Cargo.toml --lib -- -D warnings
 codesign --verify --deep --strict --verbose=2 src-tauri/target/release/bundle/macos/Qswitch.app
 ```
 
+## 发布方式
+
+当前 Q Switch 只发布经过本机验证的 Apple Silicon（arm64）macOS 测试包。为避免继承自 CC Switch 的跨平台签名、公证工作流在没有对应证书时产生误导性失败，**推送 Git 标签不会自动构建或发布**。
+
+发布者应在本机完成构建与校验后，创建 GitHub Release 并上传 DMG：
+
+```bash
+hdiutil verify src-tauri/target/release/bundle/dmg/Qswitch_3.18.0_aarch64.dmg
+shasum -a 256 src-tauri/target/release/bundle/dmg/Qswitch_3.18.0_aarch64.dmg
+gh release create v<版本>-qswitch.<序号> \
+  src-tauri/target/release/bundle/dmg/Qswitch_3.18.0_aarch64.dmg \
+  --repo miaodaxia80-droid/Q-Switch --prerelease
+```
+
+发布说明中应注明目标架构、macOS 最低版本、是否经过 Apple Developer ID 公证，以及对应的 SHA-256。若将来配置 Tauri 更新签名、Apple Developer ID 证书和公证凭据，再单独引入自动化发布流程。
+
 ## 许可证与来源
 
 Q Switch 派生自 [CC Switch](https://github.com/farion1231/cc-switch)，保留其 [MIT License](LICENSE) 及版权声明。对本分支的修改同样按 MIT License 提供。
