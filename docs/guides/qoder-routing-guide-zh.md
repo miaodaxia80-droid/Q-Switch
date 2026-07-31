@@ -23,9 +23,9 @@ MCP 的已通过回归包含明确 Node 路径和裸 `node` 两种配置；macOS
 
 ```text
 Qoder Quest / Electron
-        │ 原生 Unix IPC（兼容 WebSocket）
+        │ WebSocket 或 Unix IPC（端点均来自 .info.json）
         ▼
-Q Switch Socket Shadow 传输适配器
+Q Switch 发现记录接管适配器
         ├── 官方模型、未映射 BYOK ──► 原生 Qoder Agent（透明转发）
         └── 已映射载体模型 ──────────► Q Switch /qoder/v1
                                              │
@@ -33,7 +33,7 @@ Q Switch Socket Shadow 传输适配器
                                    已配置 provider / 自定义模型
 ```
 
-适配器会临时把 Qoder 原生 Unix socket 移到私有 shadow 路径，在原路径监听；所有不属于映射会话的 ACP/LSP JSON-RPC 帧原样转发。这样避免改写 Qoder 安装包，也避免依赖会被原生 Agent 刷新的发现文件替换。
+Qoder 的 Electron 组件从 `.info.json` 读取本机 Agent 端点（WebSocket 端口与 Unix IPC 路径）。适配器在该文件中发布自己的回环端点并保留原生坐标（`qswitchAdapter` 标记块），所有不属于映射会话的 ACP/LSP JSON-RPC 帧原样转发给原生 Agent。原生 Agent 会周期性刷新 `.info.json`（实测约每 30 秒），适配器的监视器在一个检查周期内收回记录并跟随最新原生端点；这样既不修改 Qoder 安装包，也不会被原生刷新绕开。
 
 载体模型 ID 只从同一 ACP 会话中观察，未映射的自定义载体会 fail-closed：模型选择能同步到原生 Agent，但随后 prompt 会在本机拒绝，直到用户在 Q Switch 保存映射并重新选择载体。最近观察到的未映射 ID 只保存在进程内存，不记录提示词、回复或密钥。
 
@@ -45,7 +45,7 @@ Q Switch Socket Shadow 传输适配器
 4. 启用「原生传输适配器」，然后重启 Qoder；重新选择该载体后新建 Quest。
 5. 用 Q Switch 的本地日志确认真实请求已映射。模型清单、健康检查或“适配器已启用”都不构成端到端通过。
 
-适配器关闭时恢复它自己接管的 socket；Qoder 不需要重装。若 Qoder 更新，先关闭适配器，再重新验证 ACP 帧形状和 socket 生命周期。
+适配器关闭、Q Switch 正常退出时都会把 `.info.json` 恢复为最新的原生记录，Qoder 不需要重装。若 Q Switch 异常退出（崩溃或强杀），下次启动时会自动回收仍归已死进程所有的适配器记录，Qoder 随之恢复直连原生 Agent。若 Qoder 更新，先关闭适配器，再重新验证 ACP 帧形状与发现记录生命周期。
 
 ## 工具权限与安全边界
 
@@ -76,11 +76,11 @@ Q Switch Socket Shadow 传输适配器
 - Rust Qoder 模块测试通过；需要本机回环权限的 socket 集成测试保持 `ignored`，不能记作已通过。
 - `cargo clippy --lib -- -D warnings`、`pnpm run typecheck` 与 `git diff --check` 已通过。
 - macOS 应用包完成 ad-hoc 签名并通过 `codesign --verify --deep --strict`。这适用于本机开发测试，不是 Developer ID 公证发布。
-- 以前直接改写 `.info.json` 的发现记录方案已证伪：原生 Agent 会刷新该文件。当前 socket-shadow 方案是唯一继续维护的传输路径。
+- 曾评估过只 shadow 原生 Unix socket 的传输方案：Qoder Electron 主进程按 `.info.json` 的 WebSocket 端点连接，Quest 流量会完全绕过适配器，面板观察不到载体模型。该方案已从构建中移除；发现记录接管 + 周期刷新收回是当前唯一维护的传输路径。
 
 ## 相关文件
 
-- [Socket-shadow 代理](../../src-tauri/src/qoder_acp/proxy.rs)
+- [发现记录接管代理](../../src-tauri/src/qoder_acp/proxy.rs)
 - [Qoder 工具与权限](../../src-tauri/src/qoder_acp/tools.rs)
 - [MCP 运行时](../../src-tauri/src/qoder_acp/mcp_runtime.rs)
 - [工具审计](../../src-tauri/src/qoder_acp/handler.rs)

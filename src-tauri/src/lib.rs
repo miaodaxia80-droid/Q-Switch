@@ -611,6 +611,15 @@ pub fn run() {
             // 设置 AppHandle 用于代理故障转移时的 UI 更新
             app_state.proxy_service.set_app_handle(app.handle().clone());
 
+            // 上一个 Q Switch 进程若在 Qoder 原生传输适配器激活时异常退出，
+            // Qoder 的 .info.json 仍会指向已失效的回环端点。此处仅在记录归
+            // 已死进程所有时回收，不影响正在运行的适配器实例。
+            if let Err(error) = crate::qoder_acp::info_writer::reclaim_stale_adapter_info(
+                &crate::qoder_config::get_qoder_info_path(),
+            ) {
+                log::warn!("Failed to reclaim a stale Qoder adapter record at startup: {error}");
+            }
+
             // Keep the native Qoder patch's model catalog in sync with the
             // database without exposing provider credentials in the manifest.
             let qoder_manifest_db = app_state.db.clone();
@@ -1827,8 +1836,21 @@ pub fn run() {
 /// 在应用退出前检查代理服务器状态，如果正在运行则停止代理并恢复 Live 配置。
 /// 确保 Claude Code/Codex/Gemini 的配置不会处于损坏状态。
 /// 使用 stop_with_restore_keep_state 保留 settings 表中的代理状态，下次启动时自动恢复。
+/// 同时停止 Qoder 原生传输适配器并恢复 Qoder 的 .info.json 发现记录，避免
+/// Qoder 在本进程退出后继续连接已失效的回环端点。
 pub async fn cleanup_before_exit(app_handle: &tauri::AppHandle) {
     if let Some(state) = app_handle.try_state::<store::AppState>() {
+        // 先停 Qoder 原生传输适配器：它的已路由会话依赖本地代理，且必须在
+        // 进程退出前把 Qoder 原生发现记录还原，否则 Quest 会连到已失效端点。
+        let qoder_adapter = state.qoder_native_adapter.lock().await.take();
+        if let Some(handle) = qoder_adapter {
+            if let Err(error) = crate::qoder_acp::stop_native_proxy(handle).await {
+                log::error!("退出时停止 Qoder 原生传输适配器失败: {error}");
+            } else {
+                log::info!("已停止 Qoder 原生传输适配器并恢复 Qoder 原生发现记录");
+            }
+        }
+
         let proxy_service = &state.proxy_service;
 
         // 退出时也需要兜底：代理可能已崩溃/未运行，但 Live 接管残留仍在（占位符/备份）。

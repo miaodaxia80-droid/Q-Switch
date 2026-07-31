@@ -2,10 +2,12 @@
 //!
 //! Qoder's Electron UI discovers its local Agent through `.info.json` and
 //! speaks WebSocket + LSP-framed JSON-RPC. Replacing that Agent would break
-//! official Qoder models. The desktop path therefore shadows the native Unix
-//! socket in place and forwards every non-Q-Switch frame byte-for-byte at the
-//! JSON-RPC level. Only explicitly mapped carrier sessions are answered
-//! locally through Q Switch's `/qoder/v1` gateway.
+//! official Qoder models. The desktop path therefore publishes a temporary,
+//! Q Switch-owned discovery endpoint and forwards every non-Q-Switch frame
+//! byte-for-byte at the JSON-RPC level. It reclaims native discovery refreshes
+//! while active and restores the latest native record when stopped. Only
+//! explicitly mapped carrier sessions are answered locally through Q Switch's
+//! `/qoder/v1` gateway.
 
 use crate::database::Database;
 use crate::qoder_acp::handler::{self, AcpHandlerState};
@@ -52,32 +54,9 @@ pub struct NativeProxyHandle {
     latest_snapshot: Arc<Mutex<NativeInfoSnapshot>>,
     observed_custom_model_ids: ObservedCustomModelIds,
     info_path: PathBuf,
-    socket_shadow: Option<SocketShadow>,
     shutdown_tx: watch::Sender<bool>,
     join_handle: Option<JoinHandle<()>>,
     monitor_handle: Option<JoinHandle<()>>,
-}
-
-/// The public native-socket name remains stable for Qoder while the original
-/// listener remains reachable at a private sibling path owned by Q Switch.
-#[derive(Debug, Clone)]
-struct SocketShadow {
-    public_path: PathBuf,
-    native_path: PathBuf,
-}
-
-// `PublishedDiscovery` remains compiled for deterministic loopback tests that
-// emulate Qoder's legacy discovery-file contract. Production uses only the
-// socket-shadow binding.
-#[allow(dead_code)]
-#[derive(Clone, Copy)]
-enum AdapterBinding {
-    /// Legacy test/compatibility mode: publish a replacement endpoint through
-    /// `.info.json`.
-    PublishedDiscovery,
-    /// Production macOS path: preserve Qoder's discovery record and shadow
-    /// the active Unix socket instead, so Agent refreshes cannot race us.
-    SocketShadow,
 }
 
 impl NativeProxyHandle {
@@ -133,31 +112,20 @@ impl NativeEndpoint {
 
 /// Start the adapter against an already-running native Qoder Agent.
 ///
-/// The Qoder package is never modified. The production transport shadows the
-/// currently published native IPC socket, leaving the native Agent as the
-/// downstream for official models and unmapped BYOK sessions.
+/// The Qoder package is never modified. Qoder's Electron processes discover
+/// their Agent through the WebSocket port and Unix IPC path published in
+/// `.info.json`, so the adapter takes over that discovery record and relays
+/// both transports, leaving the native Agent as the downstream for official
+/// models and unmapped BYOK sessions.
 pub async fn start_native_proxy(db: Arc<Database>) -> Result<NativeProxyHandle, String> {
-    start_native_proxy_with_binding(
-        db,
-        crate::qoder_config::get_qoder_info_path(),
-        AdapterBinding::SocketShadow,
-    )
-    .await
+    start_native_proxy_at(db, crate::qoder_config::get_qoder_info_path()).await
 }
 
-/// Test-only compatibility entrypoint for discovery-file fixtures.
-#[allow(dead_code)]
+/// Start the adapter against a specific discovery file. Tests pass temporary
+/// fixture paths; production uses Qoder's real `.info.json`.
 async fn start_native_proxy_at(
     db: Arc<Database>,
     info_path: PathBuf,
-) -> Result<NativeProxyHandle, String> {
-    start_native_proxy_with_binding(db, info_path, AdapterBinding::PublishedDiscovery).await
-}
-
-async fn start_native_proxy_with_binding(
-    db: Arc<Database>,
-    info_path: PathBuf,
-    binding: AdapterBinding,
 ) -> Result<NativeProxyHandle, String> {
     match crate::qoder_acp::info_writer::reclaim_stale_adapter_info(&info_path) {
         Ok(true) => log::warn!("[qoder_adapter] recovered a stale Q Switch discovery record"),
@@ -177,46 +145,27 @@ async fn start_native_proxy_with_binding(
         .map_err(|error| format!("Failed to read Qoder adapter address: {error}"))?
         .port();
     let adapter_pid = std::process::id();
-    let (adapter_ipc_path, ipc_listener, native_ipc_path, socket_shadow) = match binding {
-        AdapterBinding::PublishedDiscovery => {
-            // macOS limits Unix-domain socket paths to roughly 104 bytes.
-            // Keep the compatibility listener short for discovery-file tests.
-            let adapter_ipc_path = PathBuf::from("/tmp").join(format!(
-                "qswitch-qoder-{}-{}.sock",
-                adapter_pid,
-                uuid::Uuid::new_v4().simple()
-            ));
-            let ipc_listener = UnixListener::bind(&adapter_ipc_path)
-                .map_err(|error| format!("Failed to bind Qoder IPC adapter: {error}"))?;
-            crate::qoder_acp::info_writer::write_adapter_info_to(
-                &info_path,
-                &snapshot,
-                adapter_port,
-                &adapter_ipc_path,
-                adapter_pid,
-            )
-            .map_err(|error| {
-                let _ = std::fs::remove_file(&adapter_ipc_path);
-                format!("Failed to publish Qoder adapter endpoint: {error}")
-            })?;
-            (
-                adapter_ipc_path,
-                ipc_listener,
-                snapshot.ipc_server_path.clone(),
-                None,
-            )
-        }
-        AdapterBinding::SocketShadow => {
-            let (ipc_listener, shadow) =
-                shadow_native_socket(&snapshot.ipc_server_path, adapter_pid)?;
-            (
-                shadow.public_path.clone(),
-                ipc_listener,
-                shadow.native_path.clone(),
-                Some(shadow),
-            )
-        }
-    };
+    // macOS limits Unix-domain socket paths to roughly 104 bytes, so the
+    // adapter's IPC listener lives at a short, unique path under /tmp.
+    let adapter_ipc_path = PathBuf::from("/tmp").join(format!(
+        "qswitch-qoder-{}-{}.sock",
+        adapter_pid,
+        uuid::Uuid::new_v4().simple()
+    ));
+    let ipc_listener = UnixListener::bind(&adapter_ipc_path)
+        .map_err(|error| format!("Failed to bind Qoder IPC adapter: {error}"))?;
+    crate::qoder_acp::info_writer::write_adapter_info_to(
+        &info_path,
+        &snapshot,
+        adapter_port,
+        &adapter_ipc_path,
+        adapter_pid,
+    )
+    .map_err(|error| {
+        let _ = std::fs::remove_file(&adapter_ipc_path);
+        format!("Failed to publish Qoder adapter endpoint: {error}")
+    })?;
+    let native_ipc_path = snapshot.ipc_server_path.clone();
 
     let endpoint = Arc::new(NativeEndpoint::new(
         snapshot.websocket_port,
@@ -296,16 +245,17 @@ async fn start_native_proxy_with_binding(
         log::info!("[qoder_adapter] stopped");
     });
 
-    // The discovery-file compatibility path must follow native Agent refresh
-    // events. The production socket-shadow path keeps the public socket name
-    // stable, so rewriting `.info.json` cannot bypass the proxy.
-    let monitor_handle = if matches!(binding, AdapterBinding::PublishedDiscovery) {
-        let monitor_shutdown_tx = shutdown_tx.clone();
+    // Qoder's native Agent republishes `.info.json` periodically and after
+    // every restart. The monitor reclaims the discovery record within a tick
+    // so new Electron connections keep reaching this adapter, and tracks the
+    // latest native endpoint as the relay downstream.
+    let monitor_handle = tokio::spawn({
         let monitor_info_path = info_path.clone();
         let monitor_adapter_ipc_path = adapter_ipc_path.clone();
         let monitor_endpoint = endpoint.clone();
         let monitor_snapshot = latest_snapshot.clone();
-        Some(tokio::spawn(async move {
+        let monitor_shutdown_rx = shutdown_tx.subscribe();
+        async move {
             monitor_native_discovery(
                 monitor_info_path,
                 adapter_port,
@@ -313,13 +263,11 @@ async fn start_native_proxy_with_binding(
                 adapter_pid,
                 monitor_endpoint,
                 monitor_snapshot,
-                monitor_shutdown_tx.subscribe(),
+                monitor_shutdown_rx,
             )
             .await;
-        }))
-    } else {
-        None
-    };
+        }
+    });
 
     Ok(NativeProxyHandle {
         adapter_port,
@@ -329,63 +277,10 @@ async fn start_native_proxy_with_binding(
         latest_snapshot,
         observed_custom_model_ids,
         info_path,
-        socket_shadow,
         shutdown_tx,
         join_handle: Some(join_handle),
-        monitor_handle,
+        monitor_handle: Some(monitor_handle),
     })
-}
-
-/// Move Qoder's active native listener aside and claim its published path.
-/// Renaming a live Unix socket does not interrupt the native listener; it
-/// only changes the filesystem name used by future clients. Qoder keeps
-/// publishing the original path, which now reaches this proxy even if the
-/// Agent refreshes `.info.json`.
-fn shadow_native_socket(
-    public_path: &std::path::Path,
-    adapter_pid: u32,
-) -> Result<(UnixListener, SocketShadow), String> {
-    let parent = public_path
-        .parent()
-        .ok_or_else(|| "Qoder native IPC socket has no parent directory".to_string())?;
-    let file_name = public_path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .filter(|name| !name.is_empty())
-        .ok_or_else(|| "Qoder native IPC socket has no valid filename".to_string())?;
-    let nonce = uuid::Uuid::new_v4().simple().to_string();
-    let native_path = parent.join(format!("{file_name}.qs-{adapter_pid}-{}", &nonce[..6]));
-
-    std::fs::rename(public_path, &native_path).map_err(|error| {
-        format!(
-            "Failed to claim Qoder native IPC socket. Start Qoder and wait for its Agent: {error}"
-        )
-    })?;
-    match UnixListener::bind(public_path) {
-        Ok(listener) => Ok((
-            listener,
-            SocketShadow {
-                public_path: public_path.to_path_buf(),
-                native_path,
-            },
-        )),
-        Err(error) => {
-            let _ = std::fs::rename(&native_path, public_path);
-            Err(format!("Failed to bind Q Switch IPC socket: {error}"))
-        }
-    }
-}
-
-fn restore_shadowed_native_socket(shadow: &SocketShadow) -> Result<(), String> {
-    match std::fs::remove_file(&shadow.public_path) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => {
-            return Err(format!("Failed to remove Q Switch IPC socket: {error}"));
-        }
-    }
-    std::fs::rename(&shadow.native_path, &shadow.public_path)
-        .map_err(|error| format!("Failed to restore Qoder native IPC socket: {error}"))
 }
 
 async fn monitor_native_discovery(
@@ -452,11 +347,17 @@ async fn monitor_native_discovery(
             log::warn!("[qoder_adapter] cannot reclaim native .info.json: {error}");
             continue;
         }
+        let coordinates_changed = endpoint.port.load(Ordering::Relaxed) != native_port
+            || endpoint.pid.load(Ordering::Relaxed) != native_pid;
         endpoint.update(native_port, native_pid, native_ipc_path);
         *latest_snapshot.lock().await = snapshot;
-        log::info!(
-            "[qoder_adapter] reattached after native Agent refresh: 127.0.0.1:{native_port} pid={native_pid}"
-        );
+        if coordinates_changed {
+            log::info!(
+                "[qoder_adapter] reattached after native Agent refresh: 127.0.0.1:{native_port} pid={native_pid}"
+            );
+        } else {
+            log::debug!("[qoder_adapter] reclaimed periodic native .info.json refresh");
+        }
     }
 }
 
@@ -478,12 +379,6 @@ pub async fn stop_native_proxy(mut handle: NativeProxyHandle) -> Result<(), Stri
             Err(_) => log::warn!("[qoder_adapter] monitor shutdown timed out"),
         }
     }
-    if let Some(shadow) = handle.socket_shadow.take() {
-        restore_shadowed_native_socket(&shadow)?;
-        log::info!("[qoder_adapter] restored native Qoder IPC socket");
-        return Ok(());
-    }
-
     let snapshot = handle.latest_snapshot.lock().await.clone();
     let restore_result = match crate::qoder_acp::info_writer::restore_native_info_to(
         &handle.info_path,
@@ -736,9 +631,10 @@ async fn handle_connection(
     Ok(())
 }
 
-/// Relay Qoder's Unix IPC transport. Qoder 1.18 uses `ipcServerPath` for the
-/// Electron-to-Agent ACP connection; the WebSocket port is retained for
-/// compatible clients but is not the desktop application's active path.
+/// Relay Qoder's Unix IPC transport. Qoder's Electron components discover
+/// both a WebSocket port and an `ipcServerPath` in `.info.json`; the adapter
+/// publishes its own values for both, so each new connection is relayed to
+/// the native Agent regardless of which transport a component picks.
 async fn handle_ipc_connection(
     stream: UnixStream,
     state: Arc<AcpHandlerState>,
