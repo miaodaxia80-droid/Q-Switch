@@ -126,10 +126,10 @@ codesign --verify --deep --strict --verbose=2 src-tauri/target/release/bundle/ma
 发布者应在本机完成构建与校验后，创建 GitHub Release 并上传 DMG：
 
 ```bash
-hdiutil verify src-tauri/target/release/bundle/dmg/Qswitch_3.18.0_aarch64.dmg
-shasum -a 256 src-tauri/target/release/bundle/dmg/Qswitch_3.18.0_aarch64.dmg
+hdiutil verify src-tauri/target/release/bundle/dmg/Qswitch_3.18.1_aarch64.dmg
+shasum -a 256 src-tauri/target/release/bundle/dmg/Qswitch_3.18.1_aarch64.dmg
 gh release create v<版本>-qswitch.<序号> \
-  src-tauri/target/release/bundle/dmg/Qswitch_3.18.0_aarch64.dmg \
+  src-tauri/target/release/bundle/dmg/Qswitch_3.18.1_aarch64.dmg \
   --repo miaodaxia80-droid/Q-Switch --prerelease
 ```
 
