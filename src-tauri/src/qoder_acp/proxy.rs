@@ -19,7 +19,7 @@ use serde::Serialize;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU16, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, UnixListener, UnixStream};
@@ -42,6 +42,14 @@ pub struct NativeProxyStatus {
     /// process, so the user can create an explicit carrier mapping without
     /// reading Qoder internals or logs.
     pub observed_custom_model_ids: Vec<String>,
+    /// Whether any Qoder client has connected through the adapter during the
+    /// current activation. Qoder's Electron windows keep an established
+    /// connection and only re-read `.info.json` when they reconnect, so this
+    /// stays false when the adapter was enabled while Qoder was already
+    /// talking to its native Agent directly.
+    pub client_connected: bool,
+    /// Number of Qoder client connections currently relayed by the adapter.
+    pub active_client_connections: usize,
 }
 
 /// Running adapter handle. It owns the native discovery-file snapshot needed
@@ -53,6 +61,8 @@ pub struct NativeProxyHandle {
     adapter_pid: u32,
     latest_snapshot: Arc<Mutex<NativeInfoSnapshot>>,
     observed_custom_model_ids: ObservedCustomModelIds,
+    client_connections: Arc<AtomicUsize>,
+    client_connected: Arc<AtomicBool>,
     info_path: PathBuf,
     shutdown_tx: watch::Sender<bool>,
     join_handle: Option<JoinHandle<()>>,
@@ -72,6 +82,8 @@ impl NativeProxyHandle {
                 .lock()
                 .map(|ids| ids.clone())
                 .unwrap_or_default(),
+            client_connected: self.client_connected.load(Ordering::Relaxed),
+            active_client_connections: self.client_connections.load(Ordering::Relaxed),
         }
     }
 }
@@ -181,6 +193,10 @@ async fn start_native_proxy_at(
     let endpoint_for_listener = endpoint.clone();
     let observed_custom_model_ids: ObservedCustomModelIds = Arc::new(StdMutex::new(Vec::new()));
     let observed_for_listener = observed_custom_model_ids.clone();
+    let client_connections = Arc::new(AtomicUsize::new(0));
+    let client_connected = Arc::new(AtomicBool::new(false));
+    let client_connections_for_listener = client_connections.clone();
+    let client_connected_for_listener = client_connected.clone();
     let join_handle = tokio::spawn(async move {
         log::info!(
             "[qoder_adapter] listening on 127.0.0.1:{adapter_port} and IPC socket; native Agent=127.0.0.1:{native_port} pid={native_pid}"
@@ -199,6 +215,10 @@ async fn start_native_proxy_at(
                     let connection_shutdown = connection_shutdown_tx.subscribe();
                     let endpoint = endpoint_for_listener.clone();
                     let observed_custom_model_ids = observed_for_listener.clone();
+                    let client_connections = client_connections_for_listener.clone();
+                    let client_connected = client_connected_for_listener.clone();
+                    client_connections.fetch_add(1, Ordering::Relaxed);
+                    client_connected.store(true, Ordering::Relaxed);
                     tokio::spawn(async move {
                         if let Err(error) = handle_connection(
                             stream,
@@ -209,6 +229,7 @@ async fn start_native_proxy_at(
                         ).await {
                             log::warn!("[qoder_adapter] connection from {peer} closed: {error}");
                         }
+                        client_connections.fetch_sub(1, Ordering::Relaxed);
                     });
                 }
                 result = ipc_listener.accept() => {
@@ -223,6 +244,10 @@ async fn start_native_proxy_at(
                     let connection_shutdown = connection_shutdown_tx.subscribe();
                     let endpoint = endpoint_for_listener.clone();
                     let observed_custom_model_ids = observed_for_listener.clone();
+                    let client_connections = client_connections_for_listener.clone();
+                    let client_connected = client_connected_for_listener.clone();
+                    client_connections.fetch_add(1, Ordering::Relaxed);
+                    client_connected.store(true, Ordering::Relaxed);
                     tokio::spawn(async move {
                         if let Err(error) = handle_ipc_connection(
                             stream,
@@ -233,6 +258,7 @@ async fn start_native_proxy_at(
                         ).await {
                             log::warn!("[qoder_adapter] IPC connection closed: {error}");
                         }
+                        client_connections.fetch_sub(1, Ordering::Relaxed);
                     });
                 }
                 changed = shutdown_rx.changed() => {
@@ -276,6 +302,8 @@ async fn start_native_proxy_at(
         adapter_pid,
         latest_snapshot,
         observed_custom_model_ids,
+        client_connections,
+        client_connected,
         info_path,
         shutdown_tx,
         join_handle: Some(join_handle),
@@ -1036,6 +1064,11 @@ async fn handle_qswitch_message(
 mod tests {
     use super::*;
 
+    /// The two live tests take over Qoder's real `.info.json`, so they must
+    /// never run concurrently with each other. Fixture-based tests are
+    /// unaffected.
+    static LIVE_QODER_TEST_LOCK: StdMutex<()> = StdMutex::new(());
+
     #[test]
     fn qswitch_model_prefix_is_normalized() {
         assert_eq!(
@@ -1403,5 +1436,173 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&info_path).unwrap(), refreshed);
         drop(first_native);
         drop(refreshed_native);
+    }
+
+    /// Live check against a running Qoder: the adapter must take over Qoder's
+    /// real discovery record and observe a `custom:` carrier model from
+    /// `session/new` and `session/set_model` frames. Skips when Qoder is not
+    /// running; requires loopback socket permission.
+    #[tokio::test]
+    async fn live_real_qoder_adapter_observes_carrier_selection() {
+        use crate::qoder_acp::info_writer::capture_native_info_from;
+
+        let info_path = crate::qoder_config::get_qoder_info_path();
+        if capture_native_info_from(&info_path).is_err() {
+            eprintln!("SKIP: Qoder native Agent is not running; cannot run live test");
+            return;
+        }
+        let _live_guard = LIVE_QODER_TEST_LOCK.lock().unwrap();
+        let db = Arc::new(Database {
+            conn: std::sync::Mutex::new(rusqlite::Connection::open_in_memory().unwrap()),
+        });
+        let handle = start_native_proxy_at(db, info_path.clone()).await.unwrap();
+        let adapter_port = handle.adapter_port;
+        let result: Result<(Vec<String>, NativeProxyStatus), Box<dyn std::error::Error>> = async {
+            let (mut client, _) = connect_async(format!("ws://127.0.0.1:{adapter_port}")).await?;
+            let frame = LspFramer::encode(br#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#);
+            client.send(Message::Binary(frame.into())).await?;
+
+            let session_new = LspFramer::encode(
+                br#"{"jsonrpc":"2.0","id":2,"method":"session/new","params":{"cwd":"/tmp","mcpServers":[],"_meta":{"ai-coding/model-id":"custom:model_livetest123"}}}"#,
+            );
+            client.send(Message::Binary(session_new.into())).await?;
+
+            let set_model = LspFramer::encode(
+                br#"{"jsonrpc":"2.0","id":3,"method":"session/set_model","params":{"sessionId":"task-live.session.execution","modelId":"custom:model_livetest123","_meta":{}}}"#,
+            );
+            client.send(Message::Binary(set_model.into())).await?;
+
+            // Give the adapter a moment to process both frames before probing
+            // its in-memory observation list.
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            let status = handle.status();
+            assert!(
+                status.client_connected,
+                "adapter should mark the live Qoder client as connected"
+            );
+            assert!(
+                status.active_client_connections >= 1,
+                "adapter should count the live Qoder client connection"
+            );
+            let _ = client.close(None).await;
+            Ok((handle.status().observed_custom_model_ids.clone(), status))
+        }
+        .await;
+
+        stop_native_proxy(handle).await.unwrap();
+
+        match result {
+            Ok((ids, _status)) => {
+                assert!(
+                    ids.iter().any(|id| id == "model_livetest123"),
+                    "adapter should observe the custom carrier from live Qoder traffic; observed: {ids:?}"
+                );
+            }
+            Err(error) => panic!("live adapter probe failed: {error}"),
+        }
+    }
+
+    /// Live check over the Unix IPC transport: Qoder's Electron windows prefer
+    /// the IPC socket published in `.info.json`, so the adapter's IPC relay
+    /// must observe a `custom:` carrier model exactly like the WebSocket path.
+    /// Skips when Qoder is not running; requires loopback socket permission.
+    #[tokio::test]
+    async fn live_real_qoder_adapter_observes_carrier_selection_via_ipc() {
+        use crate::qoder_acp::info_writer::capture_native_info_from;
+        use tokio::io::AsyncWriteExt;
+
+        let info_path = crate::qoder_config::get_qoder_info_path();
+        if capture_native_info_from(&info_path).is_err() {
+            eprintln!("SKIP: Qoder native Agent is not running; cannot run live test");
+            return;
+        }
+        let _live_guard = LIVE_QODER_TEST_LOCK.lock().unwrap();
+        let db = Arc::new(Database {
+            conn: std::sync::Mutex::new(rusqlite::Connection::open_in_memory().unwrap()),
+        });
+        let handle = start_native_proxy_at(db, info_path.clone()).await.unwrap();
+        let adapter_ipc_path = handle.adapter_ipc_path.clone();
+        let result: Result<(Vec<String>, NativeProxyStatus), Box<dyn std::error::Error>> = async {
+            let mut stream = UnixStream::connect(&adapter_ipc_path).await?;
+            stream
+                .write_all(&LspFramer::encode(
+                    br#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#,
+                ))
+                .await?;
+            stream
+                .write_all(&LspFramer::encode(
+                    br#"{"jsonrpc":"2.0","id":2,"method":"session/new","params":{"cwd":"/tmp","mcpServers":[],"_meta":{"ai-coding/model-id":"custom:model_ipc_livetest456"}}}"#,
+                ))
+                .await?;
+            stream
+                .write_all(&LspFramer::encode(
+                    br#"{"jsonrpc":"2.0","id":3,"method":"session/set_model","params":{"sessionId":"task-ipc-live.session.execution","modelId":"custom:model_ipc_livetest456","_meta":{}}}"#,
+                ))
+                .await?;
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            let status = handle.status();
+            assert!(
+                status.client_connected,
+                "adapter should mark the live IPC Qoder client as connected"
+            );
+            let _ = stream.shutdown().await;
+            Ok((handle.status().observed_custom_model_ids.clone(), status))
+        }
+        .await;
+
+        stop_native_proxy(handle).await.unwrap();
+
+        match result {
+            Ok((ids, _status)) => assert!(
+                ids.iter().any(|id| id == "model_ipc_livetest456"),
+                "adapter should observe the custom carrier over IPC; observed: {ids:?}"
+            ),
+            Err(error) => panic!("live IPC adapter probe failed: {error}"),
+        }
+    }
+
+    /// Long-running live probe for manual restart testing. Starts the adapter
+    /// against the real Qoder discovery record, prints its endpoint and
+    /// observation status, and keeps running for a few minutes. Not intended
+    /// for CI.
+    #[tokio::test]
+    #[ignore = "long-running live probe; run explicitly with --ignored"]
+    async fn live_probe_real_qoder_adapter_endpoints() {
+        use crate::qoder_acp::info_writer::capture_native_info_from;
+
+        let info_path = crate::qoder_config::get_qoder_info_path();
+        let snapshot = match capture_native_info_from(&info_path) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                eprintln!("[probe] Qoder native Agent is not running: {error}");
+                return;
+            }
+        };
+        eprintln!(
+            "[probe] native snapshot port={} pid={} ipc={}",
+            snapshot.websocket_port,
+            snapshot.pid,
+            snapshot.ipc_server_path.display()
+        );
+        let db = Arc::new(Database {
+            conn: std::sync::Mutex::new(rusqlite::Connection::open_in_memory().unwrap()),
+        });
+        let handle = start_native_proxy_at(db, info_path.clone()).await.unwrap();
+        eprintln!(
+            "[probe] adapter port={} ipc={}",
+            handle.adapter_port,
+            handle.adapter_ipc_path.display()
+        );
+        for second in 1..=240u32 {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            let status = handle.status();
+            eprintln!(
+                "[probe] t={second}s active={} native=127.0.0.1:{} observed={:?}",
+                status.active,
+                status.native_port.unwrap_or(0),
+                status.observed_custom_model_ids
+            );
+        }
+        stop_native_proxy(handle).await.unwrap();
     }
 }

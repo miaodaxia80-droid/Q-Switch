@@ -7,6 +7,8 @@ export interface QoderNativeAdapterStatus {
   nativePort: number | null;
   nativePid: number | null;
   observedCustomModelIds: string[];
+  clientConnected: boolean;
+  activeClientConnections: number;
 }
 
 export interface QoderRouteOption {

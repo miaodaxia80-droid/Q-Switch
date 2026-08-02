@@ -273,12 +273,16 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
         )
     })?;
     fs::create_dir_all(parent)?;
+    // A unique temporary name keeps concurrent writers (e.g. two Q Switch
+    // instances, or parallel tests) from truncating each other's in-flight
+    // temp file; the final rename is atomic and the last writer wins.
     let temporary = parent.join(format!(
-        ".{}.qswitch-{}.tmp",
+        ".{}.qswitch-{}-{}.tmp",
         path.file_name()
             .and_then(|name| name.to_str())
             .unwrap_or("info.json"),
-        std::process::id()
+        std::process::id(),
+        uuid::Uuid::new_v4().simple()
     ));
     fs::write(&temporary, bytes)?;
     fs::rename(&temporary, path)

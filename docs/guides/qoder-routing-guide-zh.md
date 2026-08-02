@@ -42,10 +42,28 @@ Qoder 的 Electron 组件从 `.info.json` 读取本机 Agent 端点（WebSocket 
 1. 在 Q Switch 的「Qoder」页面确认本地路由可用，并配置好目标 provider/模型。
 2. 在 Qoder 原生 BYOK 中选择一次载体模型。
 3. 回到 Q Switch，将显示的载体 ID 映射到目标 Q Switch 路由并保存。
-4. 启用「原生传输适配器」，然后重启 Qoder；重新选择该载体后新建 Quest。
+4. 启用「原生传输适配器」，然后**重启 Qoder（或新开一个 Quest 窗口）**，再重新选择该载体后新建 Quest。
 5. 用 Q Switch 的本地日志确认真实请求已映射。模型清单、健康检查或“适配器已启用”都不构成端到端通过。
 
+> 关键：Qoder 的 Electron 窗口只会在**新建连接**时重新读取 `.info.json`。
+> 如果 Qoder 已在适配器启用之前连上原生 Agent，窗口会一直保持那条原生连接，
+> 之后的模型选择会绕过适配器，面板就“抓不到载体模型”。
+> 面板新增了「Qoder 是否已通过适配器连接」的状态：只要适配器启用后 Qoder
+> 还没有任何连接经过适配器，就会给出提示，请先重启 Qoder 或新开 Quest 窗口。
+
 适配器关闭、Q Switch 正常退出时都会把 `.info.json` 恢复为最新的原生记录，Qoder 不需要重装。若 Q Switch 异常退出（崩溃或强杀），下次启动时会自动回收仍归已死进程所有的适配器记录，Qoder 随之恢复直连原生 Agent。若 Qoder 更新，先关闭适配器，再重新验证 ACP 帧形状与发现记录生命周期。
+
+## 排障：面板观察不到载体模型
+
+1. 确认面板显示「Qoder 已通过适配器连接」；若显示「尚未通过适配器连接」，
+   说明 Qoder 窗口仍在直连原生 Agent。重启 Qoder（或新开一个 Quest 窗口）
+   后再选择一次载体模型。
+2. 确认选择动作发生在适配器启用之后；启用之前选择过的模型 ID 不会补录。
+3. 确认 `.info.json` 里的 `websocketPort`/`ipcServerPath` 属于 Q Switch
+   （`ipcServerPath` 应以 `/tmp/qswitch-qoder-` 开头）。若仍是原生记录，
+   说明适配器没有在运行，或上次异常退出留下的失效记录尚未被回收。
+4. 若 Q Switch 异常退出过：重新启动 Q Switch，启动时会自动回收失效的适配器记录，
+   再按第 1 步让 Qoder 重新连接。
 
 ## 工具权限与安全边界
 

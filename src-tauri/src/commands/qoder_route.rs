@@ -95,6 +95,8 @@ pub async fn qoder_get_native_adapter_status(
             native_port: None,
             native_pid: None,
             observed_custom_model_ids: Vec::new(),
+            client_connected: false,
+            active_client_connections: 0,
         }))
 }
 
@@ -141,5 +143,7 @@ pub async fn qoder_stop_native_adapter(
         native_port: None,
         native_pid: None,
         observed_custom_model_ids: Vec::new(),
+        client_connected: false,
+        active_client_connections: 0,
     })
 }

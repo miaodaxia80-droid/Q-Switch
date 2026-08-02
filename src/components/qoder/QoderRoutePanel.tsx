@@ -54,14 +54,19 @@ export function QoderRoutePanel() {
 
   const refresh = useCallback(async () => {
     try {
-      const [proxyStatus, nativeAdapterStatus, availableRoutes, mappings, policy] =
-        await Promise.all([
-          proxyApi.getProxyStatus(),
-          qoderRouteApi.getNativeAdapterStatus(),
-          qoderRouteApi.listRoutes(),
-          qoderRouteApi.listCarrierMappings(),
-          qoderRouteApi.getToolPolicy(),
-        ]);
+      const [
+        proxyStatus,
+        nativeAdapterStatus,
+        availableRoutes,
+        mappings,
+        policy,
+      ] = await Promise.all([
+        proxyApi.getProxyStatus(),
+        qoderRouteApi.getNativeAdapterStatus(),
+        qoderRouteApi.listRoutes(),
+        qoderRouteApi.listCarrierMappings(),
+        qoderRouteApi.getToolPolicy(),
+      ]);
       setStatus(proxyStatus);
       setAdapterStatus(nativeAdapterStatus);
       setRoutes(availableRoutes);
@@ -157,9 +162,7 @@ export function QoderRoutePanel() {
     }
   };
 
-  const handleToolPolicyChange = async (
-    changes: Partial<QoderToolPolicy>,
-  ) => {
+  const handleToolPolicyChange = async (changes: Partial<QoderToolPolicy>) => {
     if (!toolPolicy) return;
     setPolicyLoading(true);
     try {
@@ -179,8 +182,7 @@ export function QoderRoutePanel() {
   const isRunning = status?.running ?? false;
   const endpoint = `http://${status?.address || "127.0.0.1"}:${status?.port || 15731}/qoder/v1`;
   const routeById = new Map(routes.map((route) => [route.routeId, route]));
-  const observedCarrierModelIds =
-    adapterStatus?.observedCustomModelIds ?? [];
+  const observedCarrierModelIds = adapterStatus?.observedCustomModelIds ?? [];
 
   return (
     <div className="space-y-4 px-1">
@@ -283,7 +285,18 @@ export function QoderRoutePanel() {
         </p>
         {adapterStatus?.active && (
           <div className="rounded-md border border-dashed border-border-default bg-background/60 p-2">
-            {observedCarrierModelIds.length > 0 ? (
+            {!adapterStatus.clientConnected ? (
+              <div className="space-y-1">
+                <p className="text-[11px] font-medium text-amber-600 dark:text-amber-400">
+                  Qoder 尚未通过适配器连接，当前无法观察载体模型选择。
+                </p>
+                <p className="text-[11px] text-muted-foreground">
+                  Qoder 会保持启用适配器之前建立的原生连接，只有重新连接后才会走
+                  适配器。请重启 Qoder（或新开一个 Quest
+                  窗口），再次选择一次载体模型，然后回到这里刷新。
+                </p>
+              </div>
+            ) : observedCarrierModelIds.length > 0 ? (
               <>
                 <p className="mb-2 text-[11px] text-muted-foreground">
                   已检测到未映射的 Qoder 载体模型。点击即可填入上方输入框：
@@ -305,7 +318,7 @@ export function QoderRoutePanel() {
               </>
             ) : (
               <p className="text-[11px] text-muted-foreground">
-                尚未检测到载体模型。请在 Qoder 新建 Quest 后选择一次原生 BYOK
+                尚未检测到载体模型。请在 Qoder 重新选择一次原生 BYOK
                 模型，再回到这里刷新。
               </p>
             )}
@@ -367,6 +380,20 @@ export function QoderRoutePanel() {
                   ? `Electron → Q Switch IPC → 原生 Agent :${adapterStatus.nativePort}（兼容 WebSocket :${adapterStatus.adapterPort}）`
                   : "启用后仅接管 Q Switch 路由或已保存的载体映射；官方模型与未映射的 Qoder 原生 BYOK 均透明转发。"}
               </p>
+              {adapterStatus?.active && (
+                <p
+                  className={cn(
+                    "text-[11px]",
+                    adapterStatus.clientConnected
+                      ? "text-emerald-600 dark:text-emerald-400"
+                      : "text-amber-600 dark:text-amber-400",
+                  )}
+                >
+                  {adapterStatus.clientConnected
+                    ? `Qoder 已通过适配器连接（${adapterStatus.activeClientConnections} 个活跃连接）`
+                    : "Qoder 尚未通过适配器连接：请重启 Qoder 或新开 Quest 窗口后再选择载体模型"}
+                </p>
+              )}
             </div>
           </div>
           <Button
@@ -397,7 +424,8 @@ export function QoderRoutePanel() {
               Qoder 自定义模型权限
             </p>
             <p className="text-[11px] text-muted-foreground">
-              默认只允许读取工作区。开启下列能力等同于允许当前路由的上游模型使用本机工具；切换在下一个 Quest 请求生效。
+              默认只允许读取工作区。开启下列能力等同于允许当前路由的上游模型使用本机工具；切换在下一个
+              Quest 请求生效。
             </p>
           </div>
         </div>
@@ -405,8 +433,12 @@ export function QoderRoutePanel() {
         <div className="divide-y divide-border-default rounded-md border border-border-default bg-background">
           <div className="flex items-center justify-between gap-3 px-3 py-2.5">
             <div className="min-w-0">
-              <p className="text-xs font-medium text-foreground">写入工作区文件</p>
-              <p className="text-[11px] text-muted-foreground">仅可创建或替换当前工作区内的 UTF-8 文件。</p>
+              <p className="text-xs font-medium text-foreground">
+                写入工作区文件
+              </p>
+              <p className="text-[11px] text-muted-foreground">
+                仅可创建或替换当前工作区内的 UTF-8 文件。
+              </p>
             </div>
             <Switch
               checked={toolPolicy?.allowWrite ?? false}
@@ -420,7 +452,10 @@ export function QoderRoutePanel() {
           <div className="flex items-center justify-between gap-3 px-3 py-2.5">
             <div className="min-w-0">
               <p className="text-xs font-medium text-foreground">终端</p>
-              <p className="text-[11px] text-muted-foreground">命令以当前 macOS/Windows 用户身份运行，默认工作目录为当前工作区；这不是系统级沙箱。</p>
+              <p className="text-[11px] text-muted-foreground">
+                命令以当前 macOS/Windows
+                用户身份运行，默认工作目录为当前工作区；这不是系统级沙箱。
+              </p>
             </div>
             <Switch
               checked={toolPolicy?.allowTerminal ?? false}
@@ -434,7 +469,9 @@ export function QoderRoutePanel() {
           <div className="flex items-center justify-between gap-3 px-3 py-2.5">
             <div className="min-w-0">
               <p className="text-xs font-medium text-foreground">网络请求</p>
-              <p className="text-[11px] text-muted-foreground">允许受限的 HTTP/HTTPS 请求；默认阻止本机、私有和链路本地地址。</p>
+              <p className="text-[11px] text-muted-foreground">
+                允许受限的 HTTP/HTTPS 请求；默认阻止本机、私有和链路本地地址。
+              </p>
             </div>
             <Switch
               checked={toolPolicy?.allowNetwork ?? false}
@@ -443,7 +480,7 @@ export function QoderRoutePanel() {
                 void handleToolPolicyChange({
                   allowNetwork,
                   allowPrivateNetwork: allowNetwork
-                    ? toolPolicy?.allowPrivateNetwork ?? false
+                    ? (toolPolicy?.allowPrivateNetwork ?? false)
                     : false,
                 })
               }
@@ -453,7 +490,10 @@ export function QoderRoutePanel() {
           <div className="flex items-center justify-between gap-3 px-3 py-2.5">
             <div className="min-w-0">
               <p className="text-xs font-medium text-foreground">私有网络</p>
-              <p className="text-[11px] text-muted-foreground">允许访问 localhost、局域网与内网服务；仅在你明确需要本地服务时开启。</p>
+              <p className="text-[11px] text-muted-foreground">
+                允许访问
+                localhost、局域网与内网服务；仅在你明确需要本地服务时开启。
+              </p>
             </div>
             <Switch
               checked={toolPolicy?.allowPrivateNetwork ?? false}
@@ -467,7 +507,10 @@ export function QoderRoutePanel() {
           <div className="flex items-center justify-between gap-3 px-3 py-2.5">
             <div className="min-w-0">
               <p className="text-xs font-medium text-foreground">MCP 工具</p>
-              <p className="text-[11px] text-muted-foreground">还需要在“工具 / MCP”中为对应服务器勾选 Qoder；适配器支持 stdio 与 Streamable HTTP。</p>
+              <p className="text-[11px] text-muted-foreground">
+                还需要在“工具 / MCP”中为对应服务器勾选 Qoder；适配器支持 stdio
+                与 Streamable HTTP。
+              </p>
             </div>
             <Switch
               checked={toolPolicy?.allowMcp ?? false}
