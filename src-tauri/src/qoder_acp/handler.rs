@@ -205,6 +205,17 @@ pub async fn handle_message(
                 }
             }
         }
+        "session/close" => {
+            // Tear down the ACP session and drop any Anthropic signed-thinking
+            // bridge state bound to it. Responses call ids are carried in the
+            // canonical Chat history and need no separate cache.
+            if let Some(sid) = params.get("sessionId").and_then(|v| v.as_str()) {
+                state.sessions.remove(sid).await;
+                crate::proxy::providers::qoder_wire::bridge_drop_session(sid);
+                log::info!("[QoderACP] session/close cleaned session {sid}");
+            }
+            wire::send_result(tx, &id, json!({}));
+        }
         _ => {
             if id.is_some() {
                 wire::send_error(tx, &id, -32601, &format!("Method not found: {method}"));
@@ -319,6 +330,7 @@ async fn handle_prompt(
         let messages = state.sessions.messages(&session_id).await;
         let route_for_stream = route.clone();
         let tools_for_stream = tool_definitions.clone();
+        let stream_session_id = session_id.clone();
         let (event_tx, mut event_rx) = mpsc::unbounded_channel::<StreamEvent>();
         let stream_handle = tokio::spawn(async move {
             chat_client::stream_chat_completion(
@@ -327,6 +339,7 @@ async fn handle_prompt(
                 &tools_for_stream,
                 event_tx,
                 cancel_rx,
+                Some(&stream_session_id),
             )
             .await
         });

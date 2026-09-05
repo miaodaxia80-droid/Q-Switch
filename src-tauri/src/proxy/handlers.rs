@@ -793,6 +793,73 @@ async fn handle_chat_completions_for_app(
         None
     };
 
+    // Qoder three-protocol bridge: when the resolved custom provider speaks
+    // anything other than Chat Completions, convert to the native upstream
+    // protocol here and convert the response/stream back to Chat for Qoder.
+    // The Chat Completions path below is left untouched (no regression).
+    if matches!(app_type, AppType::Qoder) {
+        if let Some(route) = qoder_route.as_ref() {
+            let wire_format =
+                super::providers::qoder_wire::QoderApiFormat::parse(&route.api_format)
+                    .unwrap_or_default();
+            // Divert for non-Chat protocols, OR for Chat in full-endpoint mode
+            // (the shared forwarder can only append a path to a Base URL).
+            let needs_bridge = wire_format
+                != super::providers::qoder_wire::QoderApiFormat::OpenAiChat
+                || route.is_full_url;
+            if needs_bridge {
+                let session_id = headers
+                    .get(super::providers::qoder_wire::QODER_SESSION_HEADER)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string);
+
+                let provider = state
+                    .db
+                    .get_provider_by_id(&route.provider_id, "qoder")
+                    .map_err(|error| ProxyError::Internal(error.to_string()))?
+                    .ok_or_else(|| {
+                        ProxyError::ConfigError(format!(
+                            "Q Switch provider backing route is missing: {}",
+                            route.provider_id
+                        ))
+                    })?;
+                let cfg = super::providers::qoder_wire::QoderUpstreamConfig::from_provider(
+                    &provider,
+                    wire_format,
+                    route.is_full_url,
+                    &route.upstream_model,
+                    session_id.clone(),
+                );
+
+                // Without a stable session id, Anthropic signed-thinking tool
+                // continuation cannot be replayed: degrade to a no-tools turn
+                // rather than silently sending a broken multi-turn request.
+                let mut bridge_body = body.clone();
+                if wire_format == super::providers::qoder_wire::QoderApiFormat::AnthropicMessages
+                    && session_id.is_none()
+                {
+                    if let Some(object) = bridge_body.as_object_mut() {
+                        if object.remove("tools").is_some() {
+                            object.remove("tool_choice");
+                            log::warn!(
+                                "[QoderBridge] no stable session id; stripping tools for this Anthropic request"
+                            );
+                        }
+                    }
+                }
+
+                log::info!(
+                    "[QoderBridge] divert route to {} upstream (session={})",
+                    wire_format.as_str(),
+                    session_id.as_deref().unwrap_or("-")
+                );
+                return super::providers::qoder_wire::bridge_qoder_upstream(cfg, bridge_body).await;
+            }
+        }
+    }
+
     let mut ctx = RequestContext::new_with_provider_id(
         &state,
         &body,

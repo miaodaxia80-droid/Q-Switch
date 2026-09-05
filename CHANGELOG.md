@@ -5,6 +5,79 @@ All notable changes to CC Switch will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] - Qoder three-protocol custom providers
+
+Qoder keeps talking Chat Completions to one stable local endpoint
+(`/qoder/v1/chat/completions`); QSwitch now converts each custom provider to
+one of three upstream wire formats and converts the response/stream back.
+
+### Added
+
+- **Provider + multi-model data model**: a custom provider owns the shared
+  connection (Base URL / full endpoint, API key, API format, address mode) and
+  can carry multiple models. Stable route ids
+  (`qswitch_<provider_uuid>_<model_uuid>`) survive upstream-model renames.
+  One-time migration of the legacy flat `qoder_custom_routes_v1`, backing the
+  original blob up to `..._pre_triprotocol_backup` before removing it; carrier
+  mappings are rewritten to the stable ids.
+- **Three upstream API formats**: `openai_chat`, `anthropic_messages`
+  (`/v1/messages`, `x-api-key` + `anthropic-version`), `openai_responses`
+  (`/responses`, Bearer). New self-contained bridge `qoder_wire.rs` handles
+  request conversion, non-stream and SSE translation (text, parallel tool
+  calls, sharded tool arguments, usage, finish reason), and Anthropic signed
+  `thinking` replay via a TTL in-memory session store keyed by the ACP
+  `sessionId`. Responses function-call ids are carried through the canonical
+  Chat history on each tool round.
+- **Address modes**: Base URL (format-specific path appended, explicit query
+  preserved) vs. full request endpoint (no path appended). URL validation
+  allows only http/https, rejects userinfo/fragment; logs redact query and
+  never print API keys; upstream error bodies are never echoed.
+- **Stable ACP session id**: the native adapter forwards
+  `x-qswitch-qoder-session-id`; `session/close` drops bridge state.
+- New Tauri commands `qoder_list_custom_providers`,
+  `qoder_save_custom_provider`, `qoder_delete_custom_provider`; the Qoder panel
+  is rebuilt as a provider + multi-model manager with an API-format selector
+  and address-mode toggle (also fixes a Radix empty-value `SelectItem`).
+- Local loopback contract tests for all three protocols plus a sanitized
+  upstream-401 case; hardened the E2E harness (fixed test UUIDs, merge-not-
+  overwrite, snapshot/restore, `trap` cleanup, key-free mock logs).
+
+### Notes
+
+- QSwitch keeps its conservative 8 tool-round cap per task (Qoder 1.28.0
+  supports 500); the UI states this policy. Raising it is a separate task.
+- v1 intentionally does not add arbitrary-header / private-auth / custom-JSON
+  template support.
+
+## [3.18.1] - 2026-09-05
+
+Qoder custom routes: arbitrary model names and arbitrary OpenAI-compatible
+base URLs, independent of Qoder's built-in provider catalog, plus per-route
+thinking intensity.
+
+### Added
+
+- **Qoder Custom Models (Arbitrary Base URL + Model Name)**: A user-defined
+  custom route carries its own upstream model name, OpenAI-compatible base
+  URL, optional API key, and an optional `reasoning_effort` hint. Each route
+  is mirrored as a hidden `qoder` provider (`qswitch-custom-<id>`), so the
+  existing manifest generation and gateway forwarding pipelines resolve it
+  unchanged — the gateway opens the route's own base URL instead of a
+  Qoder-bundled provider. New Tauri commands `qoder_list_custom_routes`,
+  `qoder_save_custom_route`, `qoder_delete_custom_route`; the Qoder panel
+  gains a "自定义模型（任意请求地址）" section with an add/edit dialog
+  (name, model, base URL, API key, thinking intensity low/medium/high,
+  context window, reasoning toggle). The bridge has loopback contract
+  coverage; final Qoder 1.28.0 UI/Quest acceptance remains a manual release
+  check.
+- **`reasoning_effort` Manifest Injection**: `qoder-models.json` entries and
+  the resolved route target now carry an optional `reasoning_effort`; the
+  local gateway injects it into the forwarded chat/completions body when set.
+- **`QSWITCH_AUTO_ADAPTER=1` Headless Startup**: when set, Q Switch enables
+  the Qoder native transport adapter automatically at startup (requires the
+  Qoder native Agent to be running). Off by default; used for end-to-end
+  verification without UI clicks.
+
 ## [3.18.0] - 2026-07-21
 
 Development since v3.17.0 is headlined by Grok Build joining as the eighth managed app — full provider switching, proxy takeover on its own route namespace, MCP/Skills/prompts sync, a curated preset list, and a Grok Official entry with official-login import (schema v14/v15) — and by xAI Grok account sign-in over an OAuth device flow for Claude Code, Claude Desktop, and Codex, including a strict-gateway compatibility layer that lets codex 0.142+ drive a Grok subscription over native Responses. A usage-accounting repair wave fixes the v3.17.0 fork/sub-agent double count with a one-time automatic rebuild (schema v16) plus a manual rebuild action, makes proxy usage logging idempotent, and stops the usage page freezing during large imports. Diagnostics mature: logs persist across restarts under size rotation, every log egress redacts secrets, and renderer crashes are captured to disk behind an error boundary with a reload screen. The Codex conversion layer gets four correctness fixes — tool schemas normalized to object type, reasoning attached forward across turns, streamed tool-call identity and order preserved, and parser-required catalog fields backfilled so codex 0.144.5+ starts — while managed-OAuth providers are now reliably flagged as routing-required and Windows provider switches no longer flash a console window or freeze the UI. Rounded out by Kimi K3 presets and pricing, corrected OpenClaw preset costs, SudoCode.us restored beside SudoCode.chat, sponsor-grouped preset ordering, first-run tray language detection, and permanently deletable default Skill repositories.

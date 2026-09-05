@@ -1213,6 +1213,30 @@ pub fn run() {
                     }
                 }
 
+                // Headless convenience: `QSWITCH_AUTO_ADAPTER=1` enables the
+                // Qoder native transport adapter at startup without UI clicks.
+                // Used for end-to-end verification; off by default so the
+                // existing manual flow is unchanged.
+                if std::env::var("QSWITCH_AUTO_ADAPTER").map(|v| v == "1").unwrap_or(false) {
+                    if let Ok(providers) = state.db.get_all_providers("qoder") {
+                        if !providers.is_empty() {
+                            match crate::qoder_acp::start_native_proxy(state.db.clone()).await {
+                                Ok(handle) => {
+                                    *state.qoder_native_adapter.lock().await = Some(handle);
+                                    log::info!(
+                                        "QSWITCH_AUTO_ADAPTER: Qoder native adapter auto-enabled"
+                                    );
+                                }
+                                Err(error) => {
+                                    log::warn!(
+                                        "QSWITCH_AUTO_ADAPTER: failed to start adapter: {error}"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+
                 // 检查 settings 表中的代理状态，自动恢复代理服务
                 restore_proxy_state_on_startup(&state).await;
 
@@ -1669,6 +1693,12 @@ pub fn run() {
             commands::qoder_get_native_adapter_status,
             commands::qoder_start_native_adapter,
             commands::qoder_stop_native_adapter,
+            commands::qoder_list_custom_routes,
+            commands::qoder_save_custom_route,
+            commands::qoder_delete_custom_route,
+            commands::qoder_list_custom_providers,
+            commands::qoder_save_custom_provider,
+            commands::qoder_delete_custom_provider,
         ]);
 
     let app = builder

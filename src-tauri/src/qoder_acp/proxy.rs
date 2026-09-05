@@ -651,6 +651,7 @@ async fn handle_connection(
     let local_session_ids: Vec<String> = routing.routes.lock().await.keys().cloned().collect();
     for session_id in local_session_ids {
         state.sessions.remove(&session_id).await;
+        crate::proxy::providers::qoder_wire::bridge_drop_session(&session_id);
     }
     native_reader.abort();
     let _ = native_reader.await;
@@ -742,6 +743,7 @@ async fn handle_ipc_connection(
     let local_session_ids: Vec<String> = routing.routes.lock().await.keys().cloned().collect();
     for session_id in local_session_ids {
         state.sessions.remove(&session_id).await;
+        crate::proxy::providers::qoder_wire::bridge_drop_session(&session_id);
     }
     native_reader.abort();
     let _ = native_reader.await;
@@ -845,6 +847,18 @@ async fn handle_qswitch_message(
     };
     let params = message.get("params").cloned().unwrap_or(Value::Null);
     let session_id = params.get("sessionId").and_then(Value::as_str);
+
+    // Let the native Agent finish its own close handshake, but clean the
+    // QSwitch-side session and protocol bridge before forwarding the frame.
+    // Returning false here avoids generating a duplicate JSON-RPC response.
+    if method == "session/close" {
+        if let Some(session_id) = session_id {
+            state.sessions.remove(session_id).await;
+            crate::proxy::providers::qoder_wire::bridge_drop_session(session_id);
+            routes.lock().await.remove(session_id);
+        }
+        return false;
+    }
 
     // Quest 1.18 creates its session with the carrier embedded in
     // `params._meta["ai-coding/model-id"]`; its first prompt supplies the

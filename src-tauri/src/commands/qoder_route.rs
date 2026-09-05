@@ -1,7 +1,9 @@
 //! Tauri command for exporting Qoder's Q Switch routing catalog.
 
 use crate::qoder_acp::NativeProxyStatus;
-use crate::qoder_config::{QoderCarrierMapping, QoderRouteOption, QoderToolPolicy};
+use crate::qoder_config::{
+    QoderCarrierMapping, QoderCustomProvider, QoderCustomRoute, QoderRouteOption, QoderToolPolicy,
+};
 use crate::store::AppState;
 
 /// Refresh the stable model manifest consumed by the future native adapter.
@@ -146,4 +148,64 @@ pub async fn qoder_stop_native_adapter(
         client_connected: false,
         active_client_connections: 0,
     })
+}
+
+/// List user-defined Qoder custom routes (arbitrary model name + base URL).
+#[tauri::command]
+pub async fn qoder_list_custom_routes(
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<QoderCustomRoute>, String> {
+    crate::qoder_config::list_qoder_custom_routes(&state.db).map_err(|error| error.to_string())
+}
+
+/// Create or update a Qoder custom route, mirroring it as a hidden provider.
+#[tauri::command]
+pub async fn qoder_save_custom_route(
+    state: tauri::State<'_, AppState>,
+    route: QoderCustomRoute,
+) -> Result<QoderCustomRoute, String> {
+    crate::qoder_config::save_qoder_custom_route(&state.db, route)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+/// Delete a Qoder custom MODEL and refresh its parent provider mirror.
+#[tauri::command]
+pub async fn qoder_delete_custom_route(
+    state: tauri::State<'_, AppState>,
+    id: String,
+) -> Result<(), String> {
+    crate::qoder_config::delete_qoder_custom_route(&state.db, &id)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+/// List custom Qoder providers (API keys are masked to presence-only).
+#[tauri::command]
+pub async fn qoder_list_custom_providers(
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<QoderCustomProvider>, String> {
+    crate::qoder_config::list_qoder_custom_providers(&state.db).map_err(|error| error.to_string())
+}
+
+/// Create or update a custom Qoder provider (shared base URL / key / format).
+#[tauri::command]
+pub async fn qoder_save_custom_provider(
+    state: tauri::State<'_, AppState>,
+    provider: QoderCustomProvider,
+) -> Result<QoderCustomProvider, String> {
+    crate::qoder_config::save_qoder_custom_provider(&state.db, provider)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+/// Delete a custom Qoder provider, its models and hidden mirror.
+#[tauri::command]
+pub async fn qoder_delete_custom_provider(
+    state: tauri::State<'_, AppState>,
+    id: String,
+) -> Result<(), String> {
+    crate::qoder_config::delete_qoder_custom_provider(&state.db, &id)
+        .await
+        .map_err(|error| error.to_string())
 }

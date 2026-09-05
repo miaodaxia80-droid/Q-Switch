@@ -25,6 +25,8 @@ mod gemini;
 pub(crate) mod gemini_schema;
 pub mod gemini_shadow;
 pub mod models;
+/// Qoder canonical Chat ⇆ Chat/Anthropic/Responses upstream bridge.
+pub(crate) mod qoder_wire;
 pub(crate) mod reasoning_bridge;
 pub mod streaming;
 pub mod streaming_codex_anthropic;

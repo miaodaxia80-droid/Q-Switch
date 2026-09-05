@@ -30,6 +30,7 @@ import {
 } from "@/components/ui/select";
 import { cn } from "@/lib/utils";
 import { Switch } from "@/components/ui/switch";
+import { CustomRoutePanel } from "@/components/qoder/CustomRoutePanel";
 
 /**
  * Qoder native BYOK + local routing status.
@@ -227,6 +228,8 @@ export function QoderRoutePanel() {
           <RefreshCw className="h-3.5 w-3.5" />
         </Button>
       </div>
+
+      <CustomRoutePanel />
 
       <Button
         onClick={() => void handleSyncManifest()}

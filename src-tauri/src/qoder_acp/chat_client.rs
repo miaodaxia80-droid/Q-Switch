@@ -80,6 +80,7 @@ pub async fn stream_chat_completion(
     tools: &[Value],
     event_tx: mpsc::UnboundedSender<StreamEvent>,
     cancel_rx: oneshot::Receiver<()>,
+    session_id: Option<&str>,
 ) -> Result<StreamResult, AppError> {
     let url = build_request_url(&route.base_url);
     let client = reqwest::Client::new();
@@ -93,6 +94,14 @@ pub async fn stream_chat_completion(
 
     if let Some((header_name, header_value)) = &route.auth_header {
         request = request.header(header_name, header_value);
+    }
+    // Carry the stable ACP session id so the gateway can continue Anthropic
+    // signed-thinking / Responses function-call state across tool rounds.
+    if let Some(session_id) = session_id.map(str::trim).filter(|id| !id.is_empty()) {
+        request = request.header(
+            crate::proxy::providers::qoder_wire::QODER_SESSION_HEADER,
+            session_id,
+        );
     }
 
     let response = request

@@ -32,6 +32,20 @@
 
 完整的设计和操作说明见 [Qoder 路由指南](docs/guides/qoder-routing-guide-zh.md)。
 
+### 任意上游地址与三种协议
+
+Qoder 始终只连接 Q Switch 的本地 Chat 入口。Q Switch 根据供应商配置将请求转换到任意 HTTP/HTTPS 上游地址，支持以下三种消息协议：
+
+| Q Switch 中的 API 格式 | Base URL 模式自动追加的路径 | 适用上游 |
+| --- | --- | --- |
+| Chat Completions | `/chat/completions` | OpenAI 兼容 Chat Completions 服务 |
+| Anthropic Messages | `/v1/messages` | Anthropic Messages 兼容服务 |
+| Responses | `/responses` | OpenAI Responses 兼容服务 |
+
+若服务商提供的是完整请求地址（包括自定义路径或 query 参数），选择“完整地址”；Q Switch 会原样请求该 URL，不再重复追加路径。Base URL 模式会保留显式 query 参数。
+
+Qoder 模型选择器显示的是**载体模型**，而实际发送给上游的 `model`、地址和协议由 Q Switch 的映射决定。例如，Qoder 中选择 `GLM-5.2` 可以映射为任意服务商的 `gpt-5.5` Responses 模型。
+
 ## 详细使用流程
 
 Qoder 里的模型和 Q Switch 里的模型承担不同角色：
@@ -51,16 +65,20 @@ Qoder 里的模型和 Q Switch 里的模型承担不同角色：
 
 ### 2. 配置 Q Switch 的实际目标模型
 
-1. 启动 `Qswitch.app`。首次打开若被 Gatekeeper 拦截，请在 Finder 中右键应用并选择“打开”。
-2. 在 Q Switch 中添加实际要调用的提供商、地址、密钥和目标模型。
-3. 打开 **Qoder** 页面，确认本地路由可用，并启用“原生传输适配器”。
-4. 若 Qoder 此时已经打开，完全退出后重新启动 Qoder，使其原生 Agent 重新连接适配器。
+1. 启动 Q Switch，打开 **Qoder 自定义模型路由** 页面。
+2. 在“**自定义模型供应商（任意请求地址 · 三种消息协议）**”中点击“添加模型供应商”。
+3. 填写供应商名称、Base URL 或完整请求地址、API Key，并选择 API 格式：Chat Completions、Anthropic Messages 或 Responses。
+4. 在同一供应商下添加一个或多个模型。每个模型填写显示名称和实际上游模型名；同一地址和 Key 可复用给多个模型。
+5. 保存后，Q Switch 会刷新本机 Qoder 模型清单。确认顶部显示“Q Switch 路由端已就绪”，再启用“原生传输适配器”。
+6. 若 Qoder 已经打开，完全退出后重新启动 Qoder，使其原生 Agent 重新连接适配器。
+
+API Key 只保存在 Q Switch 本机配置中；Qoder 的模型清单、路由显示和日志都不会回显 Key。编辑已有供应商时，Key 留空表示保持原值；如需删除，需要显式开启“清除已保存的 API Key”。
 
 ### 3. 观察载体 ID 并保存映射
 
 1. 在 Qoder 新建 Quest，选择刚才创建的原生 BYOK 载体模型。
-2. 回到 Q Switch 的 **Qoder** 页面，点击刷新；面板会显示本次选择实际使用的载体模型 ID。
-3. 选择要转发到的 Q Switch 路由，点击“保存映射”。
+2. 回到 Q Switch 的 **Qoder 载体模型映射** 区域，点击刷新；面板会显示本次选择实际使用的 `custom:model_...` 载体 ID。
+3. 选择要转发到的 Q Switch 路由，例如“我的 Responses 中转 / gpt-5.5”，点击“保存映射”。
 4. 回到 Qoder，重新选择该载体模型，或新建一个 Quest 后再次选择它。
 
 未保存映射的载体会 fail-closed：Q Switch 不会把它悄悄转发到任意上游。因此，应先完成映射，再发送真实任务。
@@ -72,6 +90,20 @@ Qoder 里的模型和 Q Switch 里的模型承担不同角色：
 3. 在 Q Switch 日志确认本次会话出现载体映射和本地路由记录；这证明请求进入了 Q Switch。
 
 要使用写文件、终端、公共网络或 MCP，请在 Q Switch 的 Qoder 页面单独打开对应权限。私有网络保持关闭，除非你明确理解风险且确实需要本地服务。
+
+### 常见问题
+
+**Qoder 中显示的模型名为什么不是最终上游模型？**
+
+这是正常现象。Qoder 只认识它自己的原生 BYOK 载体；Q Switch 在本机把已经映射的载体请求转换为配置的目标模型。请以 Q Switch 的“载体模型映射”和供应商模型配置为准。
+
+**保存映射后仍然走原模型，或 Q Switch 看不到载体 ID？**
+
+确认原生传输适配器已启用，然后完全重启 Qoder 或新建 Quest，并重新选择一次载体模型。Qoder 已建立的原生 Agent 连接不会自动切换到刚启用的适配器。
+
+**Qoder 显示“系统发生异常”怎么办？**
+
+依次检查：载体映射是否存在、是否重新选择了载体、Q Switch 是否显示 Qoder 已连接、上游 URL 与 API 格式是否匹配，以及供应商卡片是否显示“已配置 API Key”。Q Switch 日志会记录脱敏后的协议、模型、最终 endpoint 和 HTTP 状态码，可用于定位 401、404 或协议不兼容问题。
 
 ## 验证安装包
 
