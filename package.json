@@ -1,6 +1,6 @@
 {
   "name": "qswitch",
-  "version": "3.18.1",
+  "version": "3.18.1-qswitch.3",
   "description": "Qoder model configuration tool based on CC Switch",
   "type": "module",
   "scripts": {

@@ -5,7 +5,7 @@ All notable changes to CC Switch will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased] - Qoder three-protocol custom providers
+## [3.18.1-qswitch.3] - 2026-09-06
 
 Qoder keeps talking Chat Completions to one stable local endpoint
 (`/qoder/v1/chat/completions`); QSwitch now converts each custom provider to
