@@ -39,7 +39,7 @@ import {
 
 // NOTE: Radix Select rejects an empty-string item value, so "follow default"
 // uses the explicit `default` sentinel rather than `value=""`.
-type EffortValue = "default" | "low" | "medium" | "high";
+type EffortValue = "default" | "low" | "medium" | "high" | "xhigh" | "max";
 type AddressMode = "base" | "full";
 
 interface ModelForm {
@@ -88,7 +88,10 @@ function emptyProviderForm(): ProviderForm {
   };
 }
 
-function providerToForm(provider: QoderCustomProvider, models: QoderCustomRoute[]): ProviderForm {
+function providerToForm(
+  provider: QoderCustomProvider,
+  models: QoderCustomRoute[],
+): ProviderForm {
   return {
     id: provider.id,
     name: provider.name,
@@ -118,7 +121,7 @@ function providerToForm(provider: QoderCustomProvider, models: QoderCustomRoute[
  * API format) and one or more models. Qoder always speaks Chat to the local
  * QSwitch gateway; the gateway converts to the selected upstream protocol.
  */
-export function CustomRoutePanel() {
+export function CustomRoutePanel({ onChanged }: { onChanged?: () => void }) {
   const [providers, setProviders] = useState<QoderCustomProvider[]>([]);
   const [models, setModels] = useState<QoderCustomRoute[]>([]);
   const [loading, setLoading] = useState(true);
@@ -138,7 +141,10 @@ export function CustomRoutePanel() {
       setProviders(providerList);
       setModels(routeList);
     } catch (error) {
-      console.error("[CustomRoutePanel] Failed to list custom providers:", error);
+      console.error(
+        "[CustomRoutePanel] Failed to list custom providers:",
+        error,
+      );
     } finally {
       inFlight.current = false;
       setLoading(false);
@@ -147,8 +153,6 @@ export function CustomRoutePanel() {
 
   useEffect(() => {
     void refresh();
-    const interval = setInterval(() => void refresh(), 5000);
-    return () => clearInterval(interval);
   }, [refresh]);
 
   const openCreate = () => {
@@ -162,12 +166,15 @@ export function CustomRoutePanel() {
     setModalOpen(true);
   };
 
-  const patchForm = (patch: Partial<ProviderForm>) => setForm((prev) => ({ ...prev, ...patch }));
+  const patchForm = (patch: Partial<ProviderForm>) =>
+    setForm((prev) => ({ ...prev, ...patch }));
 
   const patchModel = (index: number, patch: Partial<ModelForm>) =>
     setForm((prev) => ({
       ...prev,
-      models: prev.models.map((model, i) => (i === index ? { ...model, ...patch } : model)),
+      models: prev.models.map((model, i) =>
+        i === index ? { ...model, ...patch } : model,
+      ),
     }));
 
   const addModelRow = () =>
@@ -176,7 +183,10 @@ export function CustomRoutePanel() {
   const removeModelRow = (index: number) =>
     setForm((prev) => ({
       ...prev,
-      models: prev.models.length > 1 ? prev.models.filter((_, i) => i !== index) : prev.models,
+      models:
+        prev.models.length > 1
+          ? prev.models.filter((_, i) => i !== index)
+          : prev.models,
     }));
 
   const validate = (): string | null => {
@@ -184,7 +194,9 @@ export function CustomRoutePanel() {
     if (!form.baseUrl.trim()) return "请填写 Base URL 或完整请求地址。";
     if (!/^https?:\/\//.test(form.baseUrl.trim()))
       return "请求地址必须以 http:// 或 https:// 开头。";
-    const rows = form.models.filter((row) => row.name.trim() || row.model.trim());
+    const rows = form.models.filter(
+      (row) => row.name.trim() || row.model.trim(),
+    );
     if (rows.length === 0) return "请至少添加一个模型。";
     for (const row of rows) {
       if (!row.name.trim() || !row.model.trim())
@@ -218,7 +230,9 @@ export function CustomRoutePanel() {
       const providerId = saved.id || form.id;
       const before = models.filter((model) => model.providerId === providerId);
       const keepIds = new Set(form.models.map((row) => row.id).filter(Boolean));
-      const rows = form.models.filter((row) => row.name.trim() && row.model.trim());
+      const rows = form.models.filter(
+        (row) => row.name.trim() && row.model.trim(),
+      );
 
       for (const row of rows) {
         await qoderRouteApi.saveCustomRoute({
@@ -226,7 +240,8 @@ export function CustomRoutePanel() {
           providerId,
           name: row.name.trim(),
           model: row.model.trim(),
-          reasoningEffort: row.reasoningEffort === "default" ? null : row.reasoningEffort,
+          reasoningEffort:
+            row.reasoningEffort === "default" ? null : row.reasoningEffort,
           isReasoning: row.isReasoning,
           maxInputTokens: Number(row.maxInputTokens) || 128_000,
           enabled: true,
@@ -236,7 +251,7 @@ export function CustomRoutePanel() {
         if (!keepIds.has(old.id)) await qoderRouteApi.deleteCustomRoute(old.id);
       }
 
-      await qoderRouteApi.syncModelManifest();
+      onChanged?.();
       toast.success(`供应商「${saved.name}」已保存，Qoder 模型清单已刷新。`);
       setModalOpen(false);
       await refresh();
@@ -257,7 +272,7 @@ export function CustomRoutePanel() {
       return;
     try {
       await qoderRouteApi.deleteCustomProvider(provider.id);
-      await qoderRouteApi.syncModelManifest();
+      onChanged?.();
       toast.success("供应商已删除。");
       await refresh();
     } catch (err) {
@@ -269,7 +284,7 @@ export function CustomRoutePanel() {
     if (!window.confirm(`删除模型「${model.name}」？`)) return;
     try {
       await qoderRouteApi.deleteCustomRoute(model.id);
-      await qoderRouteApi.syncModelManifest();
+      onChanged?.();
       toast.success("模型已删除。");
       await refresh();
     } catch (err) {
@@ -292,7 +307,9 @@ export function CustomRoutePanel() {
             onClick={() => void refresh()}
             disabled={loading}
           >
-            <RefreshCw className={loading ? "h-3.5 w-3.5 animate-spin" : "h-3.5 w-3.5"} />
+            <RefreshCw
+              className={loading ? "h-3.5 w-3.5 animate-spin" : "h-3.5 w-3.5"}
+            />
           </Button>
           <Button size="sm" className="h-7" onClick={openCreate}>
             <Plus className="mr-1 h-3.5 w-3.5" />
@@ -303,9 +320,10 @@ export function CustomRoutePanel() {
 
       {providers.length === 0 ? (
         <p className="text-[11px] leading-relaxed text-muted-foreground">
-          先添加供应商（Base URL / 完整地址、API Key、API 格式），再在其下添加一个或多个模型。
-          Qoder 只对接 QSwitch 本地 Chat 入口，由 QSwitch 转换为 Chat Completions、
-          Anthropic Messages 或 Responses，无需改动 Qoder 安装包。
+          先添加供应商（Base URL / 完整地址、API Key、API
+          格式），再在其下添加一个或多个模型。 Qoder 只对接 QSwitch 本地 Chat
+          入口，由 QSwitch 转换为 Chat Completions、 Anthropic Messages 或
+          Responses，无需改动 Qoder 安装包。
         </p>
       ) : (
         <div className="space-y-2">
@@ -323,7 +341,8 @@ export function CustomRoutePanel() {
                       {provider.name}
                     </p>
                     <span className="shrink-0 rounded-full bg-violet-500/10 px-2 py-0.5 text-[10px] text-violet-600 dark:text-violet-300">
-                      {QODER_API_FORMAT_LABELS[provider.apiFormat] ?? provider.apiFormat}
+                      {QODER_API_FORMAT_LABELS[provider.apiFormat] ??
+                        provider.apiFormat}
                     </span>
                     <span className="shrink-0 rounded-full bg-muted px-2 py-0.5 text-[10px] text-muted-foreground">
                       {provider.isFullUrl ? "完整地址" : "Base URL"}
@@ -350,7 +369,8 @@ export function CustomRoutePanel() {
                   </div>
                 </div>
                 <p className="mt-0.5 truncate pl-5 text-[11px] text-muted-foreground">
-                  {provider.baseUrl} · {provider.hasApiKey ? "已配置 API Key" : "无 API Key"}
+                  {provider.baseUrl} ·{" "}
+                  {provider.hasApiKey ? "已配置 API Key" : "无 API Key"}
                 </p>
                 <div className="mt-1.5 space-y-1 pl-5">
                   {owned.map((model) => (
@@ -359,7 +379,9 @@ export function CustomRoutePanel() {
                       className="flex items-center justify-between gap-2 rounded bg-muted/40 px-2 py-1"
                     >
                       <div className="flex min-w-0 items-center gap-2">
-                        <span className="truncate text-[12px] text-foreground">{model.name}</span>
+                        <span className="truncate text-[12px] text-foreground">
+                          {model.name}
+                        </span>
                         <span className="shrink-0 text-[10px] text-muted-foreground">
                           {model.model}
                         </span>
@@ -382,7 +404,9 @@ export function CustomRoutePanel() {
                     </div>
                   ))}
                   {owned.length === 0 && (
-                    <p className="text-[10px] text-muted-foreground">该供应商下还没有模型。</p>
+                    <p className="text-[10px] text-muted-foreground">
+                      该供应商下还没有模型。
+                    </p>
                   )}
                 </div>
               </div>
@@ -394,9 +418,12 @@ export function CustomRoutePanel() {
       <Dialog open={modalOpen} onOpenChange={setModalOpen}>
         <DialogContent className="max-h-[85vh] overflow-y-auto sm:max-w-lg">
           <DialogHeader>
-            <DialogTitle>{form.id ? "编辑模型供应商" : "添加模型供应商"}</DialogTitle>
+            <DialogTitle>
+              {form.id ? "编辑模型供应商" : "添加模型供应商"}
+            </DialogTitle>
             <DialogDescription>
-              供应商定义连接与协议，其下可添加多个模型。保存后自动刷新 Qoder 模型清单。
+              供应商定义连接与协议，其下可添加多个模型。保存后自动刷新 Qoder
+              模型清单。
             </DialogDescription>
           </DialogHeader>
 
@@ -416,7 +443,9 @@ export function CustomRoutePanel() {
                 <Label>API 格式</Label>
                 <Select
                   value={form.apiFormat}
-                  onValueChange={(value) => patchForm({ apiFormat: value as QoderApiFormat })}
+                  onValueChange={(value) =>
+                    patchForm({ apiFormat: value as QoderApiFormat })
+                  }
                 >
                   <SelectTrigger>
                     <SelectValue />
@@ -434,7 +463,9 @@ export function CustomRoutePanel() {
                 <Label>地址类型</Label>
                 <Select
                   value={form.addressMode}
-                  onValueChange={(value) => patchForm({ addressMode: value as AddressMode })}
+                  onValueChange={(value) =>
+                    patchForm({ addressMode: value as AddressMode })
+                  }
                 >
                   <SelectTrigger>
                     <SelectValue />
@@ -449,7 +480,9 @@ export function CustomRoutePanel() {
 
             <div className="grid gap-1.5">
               <Label htmlFor="cp-url">
-                {form.addressMode === "full" ? "完整请求地址（不追加路径）" : "Base URL"}
+                {form.addressMode === "full"
+                  ? "完整请求地址（不追加路径）"
+                  : "Base URL"}
               </Label>
               <Input
                 id="cp-url"
@@ -485,7 +518,9 @@ export function CustomRoutePanel() {
                 id="cp-key"
                 type="password"
                 value={form.apiKey}
-                onChange={(e) => patchForm({ apiKey: e.target.value, clearKey: false })}
+                onChange={(e) =>
+                  patchForm({ apiKey: e.target.value, clearKey: false })
+                }
                 placeholder={form.id ? "已保存，留空不修改" : "sk-..."}
                 autoComplete="off"
               />
@@ -493,7 +528,9 @@ export function CustomRoutePanel() {
                 <label className="flex items-center gap-1.5 text-[10px] text-muted-foreground">
                   <Switch
                     checked={form.clearKey}
-                    onCheckedChange={(checked) => patchForm({ clearKey: checked, apiKey: "" })}
+                    onCheckedChange={(checked) =>
+                      patchForm({ clearKey: checked, apiKey: "" })
+                    }
                   />
                   清除已保存的 API Key
                 </label>
@@ -506,7 +543,9 @@ export function CustomRoutePanel() {
                 <Input
                   id="cp-ver"
                   value={form.anthropicVersion}
-                  onChange={(e) => patchForm({ anthropicVersion: e.target.value })}
+                  onChange={(e) =>
+                    patchForm({ anthropicVersion: e.target.value })
+                  }
                   placeholder="2023-06-01"
                 />
               </div>
@@ -514,8 +553,15 @@ export function CustomRoutePanel() {
 
             <div className="mt-1 space-y-2 rounded-md border border-border-default p-2">
               <div className="flex items-center justify-between">
-                <span className="text-xs font-medium text-foreground">模型列表</span>
-                <Button variant="outline" size="sm" className="h-7" onClick={addModelRow}>
+                <span className="text-xs font-medium text-foreground">
+                  模型列表
+                </span>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="h-7"
+                  onClick={addModelRow}
+                >
                   <Plus className="mr-1 h-3 w-3" />
                   添加模型
                 </Button>
@@ -525,7 +571,9 @@ export function CustomRoutePanel() {
                   <div className="flex items-center gap-2">
                     <Input
                       value={model.name}
-                      onChange={(e) => patchModel(index, { name: e.target.value })}
+                      onChange={(e) =>
+                        patchModel(index, { name: e.target.value })
+                      }
                       placeholder="显示名称，例如 Claude Sonnet"
                       className="h-8 text-xs"
                     />
@@ -541,7 +589,9 @@ export function CustomRoutePanel() {
                   </div>
                   <Input
                     value={model.model}
-                    onChange={(e) => patchModel(index, { model: e.target.value })}
+                    onChange={(e) =>
+                      patchModel(index, { model: e.target.value })
+                    }
                     placeholder="上游模型名，例如 claude-sonnet-4-5"
                     className="h-8 text-xs"
                   />
@@ -549,7 +599,9 @@ export function CustomRoutePanel() {
                     <Select
                       value={model.reasoningEffort}
                       onValueChange={(value) =>
-                        patchModel(index, { reasoningEffort: value as EffortValue })
+                        patchModel(index, {
+                          reasoningEffort: value as EffortValue,
+                        })
                       }
                     >
                       <SelectTrigger className="h-8 text-xs">
@@ -560,13 +612,17 @@ export function CustomRoutePanel() {
                         <SelectItem value="low">低（low）</SelectItem>
                         <SelectItem value="medium">中（medium）</SelectItem>
                         <SelectItem value="high">高（high）</SelectItem>
+                        <SelectItem value="xhigh">极高（xhigh）</SelectItem>
+                        <SelectItem value="max">最高（max）</SelectItem>
                       </SelectContent>
                     </Select>
                     <Input
                       type="number"
                       value={model.maxInputTokens}
                       onChange={(e) =>
-                        patchModel(index, { maxInputTokens: Number(e.target.value) || 128_000 })
+                        patchModel(index, {
+                          maxInputTokens: Number(e.target.value) || 128_000,
+                        })
                       }
                       className="h-8 text-xs"
                       placeholder="max_input_tokens"
@@ -575,7 +631,9 @@ export function CustomRoutePanel() {
                   <label className="flex items-center gap-2 text-[11px] text-muted-foreground">
                     <Switch
                       checked={model.isReasoning}
-                      onCheckedChange={(checked) => patchModel(index, { isReasoning: checked })}
+                      onCheckedChange={(checked) =>
+                        patchModel(index, { isReasoning: checked })
+                      }
                     />
                     支持推理（reasoning）
                   </label>

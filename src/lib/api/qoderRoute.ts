@@ -1,36 +1,10 @@
 import { invoke } from "@tauri-apps/api/core";
-
-export interface QoderNativeAdapterStatus {
-  active: boolean;
-  adapterPort: number | null;
-  adapterIpcPath: string | null;
-  nativePort: number | null;
-  nativePid: number | null;
-  observedCustomModelIds: string[];
-  clientConnected: boolean;
-  activeClientConnections: number;
-}
-
 export interface QoderRouteOption {
   routeId: string;
   displayName: string;
   providerId: string;
   model: string;
 }
-
-export interface QoderCarrierMapping {
-  carrierModelId: string;
-  routeId: string;
-}
-
-export interface QoderToolPolicy {
-  allowTerminal: boolean;
-  allowWrite: boolean;
-  allowNetwork: boolean;
-  allowPrivateNetwork: boolean;
-  allowMcp: boolean;
-}
-
 /// Upstream wire formats supported by the Qoder bridge.
 export type QoderApiFormat =
   | "openai_chat"
@@ -76,75 +50,21 @@ export interface QoderCustomRoute {
 }
 
 export const qoderRouteApi = {
-  async syncModelManifest(): Promise<string> {
-    return await invoke("qoder_sync_model_manifest");
-  },
-
-  async listRoutes(): Promise<QoderRouteOption[]> {
-    return await invoke("qoder_list_routes");
-  },
-
-  async listCarrierMappings(): Promise<QoderCarrierMapping[]> {
-    return await invoke("qoder_list_carrier_mappings");
-  },
-
-  async saveCarrierMapping(
-    carrierModelId: string,
-    routeId: string,
-  ): Promise<QoderCarrierMapping> {
-    return await invoke("qoder_save_carrier_mapping", {
-      carrierModelId,
-      routeId,
-    });
-  },
-
-  async removeCarrierMapping(carrierModelId: string): Promise<void> {
-    return await invoke("qoder_remove_carrier_mapping", { carrierModelId });
-  },
-
-  async getToolPolicy(): Promise<QoderToolPolicy> {
-    return await invoke("qoder_get_tool_policy");
-  },
-
-  async setToolPolicy(policy: QoderToolPolicy): Promise<QoderToolPolicy> {
-    return await invoke("qoder_set_tool_policy", { policy });
-  },
-
-  async getNativeAdapterStatus(): Promise<QoderNativeAdapterStatus> {
-    return await invoke("qoder_get_native_adapter_status");
-  },
-
-  async startNativeAdapter(): Promise<QoderNativeAdapterStatus> {
-    return await invoke("qoder_start_native_adapter");
-  },
-
-  async stopNativeAdapter(): Promise<QoderNativeAdapterStatus> {
-    return await invoke("qoder_stop_native_adapter");
-  },
-
-  async listCustomRoutes(): Promise<QoderCustomRoute[]> {
-    return await invoke("qoder_list_custom_routes");
-  },
-
-  async saveCustomRoute(route: QoderCustomRoute): Promise<QoderCustomRoute> {
-    return await invoke("qoder_save_custom_route", { route });
-  },
-
-  async deleteCustomRoute(id: string): Promise<void> {
-    return await invoke("qoder_delete_custom_route", { id });
-  },
-
-  async listCustomProviders(): Promise<QoderCustomProvider[]> {
-    return await invoke("qoder_list_custom_providers");
-  },
-
-  async saveCustomProvider(
-    provider: QoderCustomProvider,
-  ): Promise<QoderCustomProvider> {
-    return await invoke("qoder_save_custom_provider", { provider });
-  },
-
-  async deleteCustomProvider(id: string): Promise<void> {
-    return await invoke("qoder_delete_custom_provider", { id });
-  },
+  syncNativeProvider: (target: "qoder" | "qoder-cn", routeId: string) =>
+    invoke<string>("qoder_sync_native_provider", { target, routeId }),
+  removeNativeProvider: (target: "qoder" | "qoder-cn") =>
+    invoke<string>("qoder_remove_native_provider", { target }),
+  listRoutes: () => invoke<QoderRouteOption[]>("qoder_list_routes"),
+  listCustomProviders: () =>
+    invoke<QoderCustomProvider[]>("qoder_list_custom_providers"),
+  listCustomRoutes: () =>
+    invoke<QoderCustomRoute[]>("qoder_list_custom_routes"),
+  saveCustomProvider: (provider: QoderCustomProvider) =>
+    invoke<QoderCustomProvider>("qoder_save_custom_provider", { provider }),
+  saveCustomRoute: (route: QoderCustomRoute) =>
+    invoke<QoderCustomRoute>("qoder_save_custom_route", { route }),
+  deleteCustomProvider: (id: string) =>
+    invoke<void>("qoder_delete_custom_provider", { id }),
+  deleteCustomRoute: (id: string) =>
+    invoke<void>("qoder_delete_custom_route", { id }),
 };

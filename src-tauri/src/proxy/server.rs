@@ -1,416 +1,301 @@
-//! HTTP代理服务器
-//!
-//! 基于Axum的HTTP服务器，处理代理请求
-//!
-//! Uses a manual hyper HTTP/1.1 accept loop with `preserve_header_case(true)` so
-//! that the original header-name casing from the CLI client is captured in a
-//! `HeaderCaseMap` extension.  This map is later forwarded to the upstream via
-//! the hyper-based HTTP client, producing wire-level header casing identical to
-//! a direct (non-proxied) CLI request.
-
+//! Qoder-only loopback gateway. No client takeover, telemetry or periodic scans.
 use super::{
-    failover_switch::FailoverSwitchManager,
-    handlers,
-    log_codes::srv as log_srv,
-    provider_router::ProviderRouter,
-    providers::{codex_chat_history::CodexChatHistoryStore, gemini_shadow::GeminiShadowStore},
-    types::*,
+    providers::qoder_wire::{self, QoderApiFormat, QoderUpstreamConfig},
     ProxyError,
 };
-use crate::database::Database;
+use crate::{database::Database, qoder_config};
 use axum::{
-    extract::DefaultBodyLimit,
-    routing::{any, get, post},
-    Router,
+    extract::{DefaultBodyLimit, State},
+    http::HeaderMap,
+    response::{IntoResponse, Response},
+    routing::{get, post},
+    Json, Router,
 };
-use hyper_util::rt::TokioIo;
-use std::net::SocketAddr;
-use std::sync::Arc;
-use tokio::sync::{oneshot, RwLock};
-use tokio::task::JoinHandle;
+use serde::Serialize;
+use serde_json::{json, Value};
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
+use tokio::{sync::Mutex, task::JoinHandle};
 
-/// 代理服务器状态（共享）
-#[derive(Clone)]
-pub struct ProxyState {
+pub struct Gateway {
     pub db: Arc<Database>,
-    pub config: Arc<RwLock<ProxyConfig>>,
-    pub status: Arc<RwLock<ProxyStatus>>,
-    pub start_time: Arc<RwLock<Option<std::time::Instant>>>,
-    /// 每个应用类型当前使用的 provider (app_type -> (provider_id, provider_name))
-    pub current_providers: Arc<RwLock<std::collections::HashMap<String, (String, String)>>>,
-    /// 共享的 ProviderRouter（持有熔断器状态，跨请求保持）
-    pub provider_router: Arc<ProviderRouter>,
-    /// Gemini Native shadow state，用于 thoughtSignature / tool call 回放
-    pub gemini_shadow: Arc<GeminiShadowStore>,
-    /// Codex Chat bridge history，用于恢复 previous_response_id 指向的 tool call
-    pub codex_chat_history: Arc<CodexChatHistoryStore>,
-    /// AppHandle，用于发射事件和更新托盘菜单
-    pub app_handle: Option<tauri::AppHandle>,
-    /// 故障转移切换管理器
-    pub failover_manager: Arc<FailoverSwitchManager>,
+    task: Mutex<Option<JoinHandle<()>>>,
+    requests: AtomicU64,
 }
-
-/// 代理HTTP服务器
-pub struct ProxyServer {
-    config: ProxyConfig,
-    state: ProxyState,
-    shutdown_tx: Arc<RwLock<Option<oneshot::Sender<()>>>>,
-    /// 服务器任务句柄，用于等待服务器实际关闭
-    server_handle: Arc<RwLock<Option<JoinHandle<()>>>>,
+#[derive(Debug, Serialize)]
+pub struct GatewayStatus {
+    pub running: bool,
+    pub address: String,
+    pub port: u16,
+    pub total_requests: u64,
 }
-
-impl ProxyServer {
-    pub fn new(
-        config: ProxyConfig,
-        db: Arc<Database>,
-        app_handle: Option<tauri::AppHandle>,
-    ) -> Self {
-        // 创建共享的 ProviderRouter（熔断器状态将跨所有请求保持）
-        let provider_router = Arc::new(ProviderRouter::new(db.clone()));
-        // 创建故障转移切换管理器
-        let failover_manager = Arc::new(FailoverSwitchManager::new(db.clone()));
-
-        let state = ProxyState {
-            db,
-            config: Arc::new(RwLock::new(config.clone())),
-            status: Arc::new(RwLock::new(ProxyStatus::default())),
-            start_time: Arc::new(RwLock::new(None)),
-            current_providers: Arc::new(RwLock::new(std::collections::HashMap::new())),
-            provider_router,
-            gemini_shadow: Arc::new(GeminiShadowStore::default()),
-            codex_chat_history: Arc::new(CodexChatHistoryStore::default()),
-            app_handle,
-            failover_manager,
-        };
-
+impl Gateway {
+    pub fn new(db: Arc<Database>) -> Self {
         Self {
-            config,
-            state,
-            shutdown_tx: Arc::new(RwLock::new(None)),
-            server_handle: Arc::new(RwLock::new(None)),
+            db,
+            task: Mutex::new(None),
+            requests: AtomicU64::new(0),
         }
     }
-
-    pub async fn start(&self) -> Result<ProxyServerInfo, ProxyError> {
-        // 检查是否已在运行
-        if self.shutdown_tx.read().await.is_some() {
-            return Err(ProxyError::AlreadyRunning);
-        }
-
-        let addr: SocketAddr =
-            format!("{}:{}", self.config.listen_address, self.config.listen_port)
-                .parse()
-                .map_err(|e| ProxyError::BindFailed(format!("无效的地址: {e}")))?;
-
-        // 创建关闭通道
-        let (shutdown_tx, shutdown_rx) = oneshot::channel();
-
-        // 构建路由
-        let app = self.build_router();
-
-        // 绑定监听器
-        let listener = tokio::net::TcpListener::bind(&addr)
-            .await
-            .map_err(|e| ProxyError::BindFailed(e.to_string()))?;
-        let local_addr = listener
-            .local_addr()
-            .map_err(|e| ProxyError::BindFailed(e.to_string()))?;
-        let actual_port = local_addr.port();
-
-        log::info!("[{}] 代理服务器启动于 {local_addr}", log_srv::STARTED);
-
-        // 更新全局代理端口，用于系统代理检测
-        crate::proxy::http_client::set_proxy_port(actual_port);
-
-        // 保存关闭句柄
-        *self.shutdown_tx.write().await = Some(shutdown_tx);
-
-        // 更新状态
-        let mut status = self.state.status.write().await;
-        status.running = true;
-        status.address = self.config.listen_address.clone();
-        status.port = actual_port;
-        drop(status);
-
-        // 记录启动时间
-        *self.state.start_time.write().await = Some(std::time::Instant::now());
-
-        // 启动服务器 — 使用手动 hyper HTTP/1.1 accept loop
-        // 开启 preserve_header_case 以捕获客户端请求头的原始大小写
-        let state = self.state.clone();
-        let handle = tokio::spawn(async move {
-            let mut shutdown_rx = shutdown_rx;
-            loop {
-                tokio::select! {
-                    result = listener.accept() => {
-                        let (stream, _remote_addr) = match result {
-                            Ok(v) => v,
-                            Err(e) => {
-                                log::error!("[{SRV}] accept 失败: {e}", SRV = log_srv::ACCEPT_ERR);
-                                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                                continue;
-                            }
-                        };
-
-                        let app = app.clone();
-                        tokio::spawn(async move {
-                            // Peek raw TCP bytes to capture original header casing
-                            // before hyper parses (and lowercases) the header names.
-                            let original_cases = {
-                                let mut peek_buf = vec![0u8; 8192];
-                                match stream.peek(&mut peek_buf).await {
-                                    Ok(n) => {
-                                        let cases = super::hyper_client::OriginalHeaderCases::from_raw_bytes(&peek_buf[..n]);
-                                        log::debug!(
-                                            "[ProxyServer] Peeked {} bytes, captured {} header casings",
-                                            n, cases.cases.len()
-                                        );
-                                        cases
-                                    }
-                                    Err(e) => {
-                                        log::debug!("[ProxyServer] peek failed (non-fatal): {e}");
-                                        super::hyper_client::OriginalHeaderCases::default()
-                                    }
-                                }
-                            };
-
-                            // service_fn 将 axum Router（tower::Service）桥接到 hyper
-                            let service = hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
-                                let mut router = app.clone();
-                                let cases = original_cases.clone();
-                                async move {
-                                    // 将 hyper::body::Incoming 转为 axum::body::Body，保留 extensions
-                                    let (mut parts, body) = req.into_parts();
-
-                                    // Insert our own header case map alongside hyper's internal one
-                                    parts.extensions.insert(cases);
-
-                                    let body = axum::body::Body::new(body);
-                                    let axum_req = http::Request::from_parts(parts, body);
-                                    <Router as tower::Service<http::Request<axum::body::Body>>>::call(&mut router, axum_req).await
-                                }
-                            });
-
-                            if let Err(e) = hyper::server::conn::http1::Builder::new()
-                                .preserve_header_case(true)
-                                .serve_connection(TokioIo::new(stream), service)
-                                .await
-                            {
-                                // Connection reset / broken pipe 等在代理场景下很常见，debug 级别
-                                log::debug!("[{SRV}] connection error: {e}", SRV = log_srv::CONN_ERR);
-                            }
-                        });
-                    }
-                    _ = &mut shutdown_rx => {
-                        break;
-                    }
-                }
-            }
-
-            // 服务器停止后更新状态
-            state.status.write().await.running = false;
-            *state.start_time.write().await = None;
-        });
-
-        // 保存服务器任务句柄
-        *self.server_handle.write().await = Some(handle);
-
-        Ok(ProxyServerInfo {
-            address: self.config.listen_address.clone(),
-            port: actual_port,
-            started_at: chrono::Utc::now().to_rfc3339(),
+    pub async fn status(&self) -> Result<GatewayStatus, String> {
+        Ok(GatewayStatus {
+            running: self
+                .task
+                .lock()
+                .await
+                .as_ref()
+                .is_some_and(|t| !t.is_finished()),
+            address: "127.0.0.1".into(),
+            port: self
+                .db
+                .get_proxy_config()
+                .await
+                .map_err(|e| e.to_string())?
+                .listen_port,
+            total_requests: self.requests.load(Ordering::Relaxed),
         })
     }
-
-    pub async fn stop(&self) -> Result<(), ProxyError> {
-        // 1. 发送关闭信号
-        if let Some(tx) = self.shutdown_tx.write().await.take() {
-            let _ = tx.send(());
-        } else {
-            return Err(ProxyError::NotRunning);
+    pub async fn start(self: &Arc<Self>) -> Result<GatewayStatus, String> {
+        let mut slot = self.task.lock().await;
+        if slot.as_ref().is_some_and(|t| !t.is_finished()) {
+            drop(slot);
+            return self.status().await;
         }
-
-        // 2. 等待服务器任务结束（带 5 秒超时保护）
-        if let Some(handle) = self.server_handle.write().await.take() {
-            match tokio::time::timeout(std::time::Duration::from_secs(5), handle).await {
-                Ok(Ok(())) => {
-                    log::info!("[{}] 代理服务器已完全停止", log_srv::STOPPED);
-                    Ok(())
-                }
-                Ok(Err(e)) => {
-                    log::warn!("[{}] 代理服务器任务异常终止: {e}", log_srv::TASK_ERROR);
-                    Err(ProxyError::StopFailed(e.to_string()))
-                }
-                Err(_) => {
-                    log::warn!(
-                        "[{}] 代理服务器停止超时（5秒），强制继续",
-                        log_srv::STOP_TIMEOUT
-                    );
-                    Err(ProxyError::StopTimeout)
-                }
+        qoder_config::sync_qoder_model_manifest(&self.db)
+            .await
+            .map_err(|e| e.to_string())?;
+        let port = self
+            .db
+            .get_proxy_config()
+            .await
+            .map_err(|e| e.to_string())?
+            .listen_port;
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))
+            .await
+            .map_err(|_| {
+                format!("Cannot bind local port {port}; check whether another Q Switch is running")
+            })?;
+        let router = Router::new()
+            .route("/health", get(|| async { Json(json!({"status":"ok"})) }))
+            .route("/qoder/v1/models", get(models))
+            .route("/qoder/v1/chat/completions", post(chat))
+            .layer(DefaultBodyLimit::max(32 * 1024 * 1024))
+            .with_state(self.clone());
+        *slot = Some(tokio::spawn(async move {
+            if let Err(error) = axum::serve(listener, router).await {
+                log::error!("Qoder gateway stopped: {error}");
             }
-        } else {
-            Ok(())
+        }));
+        drop(slot);
+        self.status().await
+    }
+    pub async fn stop(&self) {
+        if let Some(task) = self.task.lock().await.take() {
+            task.abort();
+            let _ = task.await;
         }
     }
-
-    pub async fn get_status(&self) -> ProxyStatus {
-        let mut status = self.state.status.read().await.clone();
-
-        // 计算运行时间
-        if let Some(start) = *self.state.start_time.read().await {
-            status.uptime_seconds = start.elapsed().as_secs();
-        }
-
-        // 从 current_providers HashMap 获取每个应用类型当前正在使用的 provider
-        let current_providers = self.state.current_providers.read().await;
-        status.active_targets = current_providers
-            .iter()
-            .map(|(app_type, (provider_id, provider_name))| ActiveTarget {
-                app_type: app_type.clone(),
-                provider_id: provider_id.clone(),
-                provider_name: provider_name.clone(),
-            })
-            .collect();
-
-        status
+}
+async fn models(State(state): State<Arc<Gateway>>) -> Result<Json<Value>, ProxyError> {
+    let routes = qoder_config::list_qoder_route_options(&state.db)
+        .await
+        .map_err(|e| ProxyError::ConfigError(e.to_string()))?;
+    Ok(Json(
+        json!({"object":"list","data":routes.into_iter().map(|r|json!({"id":r.route_id,"object":"model","owned_by":"qswitch"})).collect::<Vec<_>>()}),
+    ))
+}
+async fn chat(
+    State(state): State<Arc<Gateway>>,
+    headers: HeaderMap,
+    Json(mut body): Json<Value>,
+) -> Result<Response, ProxyError> {
+    if headers.get("authorization").and_then(|v| v.to_str().ok()) != Some("Bearer qswitch-local") {
+        return Ok((
+            axum::http::StatusCode::UNAUTHORIZED,
+            Json(json!({"error":{"message":"Invalid local gateway credential"}})),
+        )
+            .into_response());
     }
+    let model = body
+        .get("model")
+        .and_then(Value::as_str)
+        .ok_or_else(|| ProxyError::InvalidRequest("model is required".into()))?;
+    let route = qoder_config::resolve_qoder_route(model)
+        .map_err(|e| ProxyError::ConfigError(e.to_string()))?
+        .ok_or_else(|| {
+            ProxyError::InvalidRequest("Unknown or disabled Q Switch model route".into())
+        })?;
+    let provider = state
+        .db
+        .get_provider_by_id(&route.provider_id, "qoder")
+        .map_err(|e| ProxyError::ConfigError(e.to_string()))?
+        .ok_or_else(|| ProxyError::ConfigError("Provider no longer exists".into()))?;
+    body["model"] = json!(route.upstream_model);
+    if body.get("reasoning_effort").is_none() {
+        if let Some(effort) = route.reasoning_effort {
+            body["reasoning_effort"] = json!(effort);
+        }
+    }
+    let format = QoderApiFormat::parse(&route.api_format)?;
+    let session = headers
+        .get(qoder_wire::QODER_SESSION_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .filter(|v| !v.is_empty())
+        .map(str::to_string);
+    if format == QoderApiFormat::AnthropicMessages && session.is_none() {
+        if let Some(obj) = body.as_object_mut() {
+            obj.remove("tools");
+            obj.remove("tool_choice");
+        }
+    }
+    state.requests.fetch_add(1, Ordering::Relaxed);
+    qoder_wire::bridge_qoder_upstream(
+        QoderUpstreamConfig::from_provider(
+            &provider,
+            format,
+            route.is_full_url,
+            &route.upstream_model,
+            session,
+        ),
+        body,
+    )
+    .await
+}
 
-    /// 更新某个应用类型当前“目标供应商”（用于 UI 展示 active_targets）
-    ///
-    /// 注意：这不代表该供应商一定已经处理过请求，而是用于“热切换/启用故障转移立即切 P1”
-    /// 等场景下，让 UI 能立刻反映最新目标。
-    pub async fn set_active_target(&self, app_type: &str, provider_id: &str, provider_name: &str) {
-        let mut current_providers = self.state.current_providers.write().await;
-        current_providers.insert(
-            app_type.to_string(),
-            (provider_id.to_string(), provider_name.to_string()),
+#[cfg(test)]
+mod tests {
+    use super::*;
+    // Both fixtures export the process-wide model manifest. Serialize their
+    // lifecycle so one empty fixture cannot replace the other's route catalog.
+    static GATEWAY_TEST_LOCK: Mutex<()> = Mutex::const_new(());
+
+    #[tokio::test]
+    async fn native_route_rewrites_model_and_auth_and_rejects_disabled_models() {
+        let _guard = GATEWAY_TEST_LOCK.lock().await;
+        let captured = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let sink = captured.clone();
+        let upstream = Router::new().route("/v1/chat/completions", post(move |headers: HeaderMap, Json(body): Json<Value>| {
+            let sink = sink.clone();
+            async move {
+                assert_eq!(headers["authorization"], "Bearer upstream-secret");
+                sink.lock().await.push(body);
+                Json(json!({"id":"reply","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}))
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_port = listener.local_addr().unwrap().port();
+        let upstream_task = tokio::spawn(async move {
+            axum::serve(listener, upstream).await.unwrap();
+        });
+        let db = Arc::new(Database::memory().unwrap());
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        db.set_setting("qoder_listen_port", &port.to_string())
+            .unwrap();
+        qoder_config::save_qoder_custom_provider(
+            &db,
+            qoder_config::QoderCustomProvider {
+                id: "test-provider".into(),
+                name: "Provider".into(),
+                base_url: format!("http://127.0.0.1:{upstream_port}/v1"),
+                api_key: Some("upstream-secret".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let mut model = qoder_config::save_qoder_custom_route(
+            &db,
+            qoder_config::QoderCustomRoute {
+                id: "test-model".into(),
+                provider_id: "test-provider".into(),
+                name: "Model".into(),
+                model: "actual-model".into(),
+                reasoning_effort: Some("high".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let gateway = Arc::new(Gateway::new(db.clone()));
+        gateway.start().await.unwrap();
+        let client = reqwest::Client::new();
+        let url = format!("http://127.0.0.1:{port}/qoder/v1/chat/completions");
+        let body = json!({"model":qoder_config::stable_qoder_route_id("test-provider", "test-model"),"messages":[{"role":"user","content":"hello"}],"stream":false});
+        let response = client
+            .post(&url)
+            .bearer_auth("qswitch-local")
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        assert_eq!(captured.lock().await[0]["model"], "actual-model");
+        assert_eq!(captured.lock().await[0]["reasoning_effort"], "high");
+        model.enabled = false;
+        qoder_config::save_qoder_custom_route(&db, model)
+            .await
+            .unwrap();
+        assert_eq!(
+            client
+                .post(&url)
+                .bearer_auth("qswitch-local")
+                .json(&body)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            400
         );
+        assert_eq!(captured.lock().await.len(), 1);
+        gateway.stop().await;
+        upstream_task.abort();
     }
-
-    fn build_router(&self) -> Router {
-        Router::new()
-            // 健康检查
-            .route("/health", get(handlers::health_check))
-            .route("/status", get(handlers::get_status))
-            // Claude API (支持带前缀和不带前缀两种格式)
-            .route("/v1/messages", post(handlers::handle_messages))
-            .route("/claude/v1/messages", post(handlers::handle_messages))
-            // Claude Desktop 3P 本地 gateway（独立 provider namespace）
-            .route(
-                "/claude-desktop/v1/models",
-                get(handlers::handle_claude_desktop_models),
-            )
-            .route(
-                "/claude-desktop/v1/messages",
-                post(handlers::handle_claude_desktop_messages),
-            )
-            // OpenAI Chat Completions API (Codex CLI，支持带前缀和不带前缀)
-            .route("/chat/completions", post(handlers::handle_chat_completions))
-            .route(
-                "/v1/chat/completions",
-                post(handlers::handle_chat_completions),
-            )
-            .route(
-                "/v1/v1/chat/completions",
-                post(handlers::handle_chat_completions),
-            )
-            .route(
-                "/codex/v1/chat/completions",
-                post(handlers::handle_chat_completions),
-            )
-            // Qoder 原生 Agent 的 OpenAI 兼容入口
-            .route(
-                "/qoder/chat/completions",
-                post(handlers::handle_qoder_chat_completions),
-            )
-            .route(
-                "/qoder/v1/chat/completions",
-                post(handlers::handle_qoder_chat_completions),
-            )
-            .route("/qoder/models", get(handlers::handle_qoder_models))
-            .route("/qoder/v1/models", get(handlers::handle_qoder_models))
-            // OpenAI Models API (Codex CLI reachability check)
-            .route("/models", get(handlers::handle_models))
-            .route("/v1/models", get(handlers::handle_models))
-            // OpenAI Responses API (Codex CLI，支持带前缀和不带前缀)
-            .route("/responses", post(handlers::handle_responses))
-            .route("/v1/responses", post(handlers::handle_responses))
-            .route("/v1/v1/responses", post(handlers::handle_responses))
-            .route("/codex/v1/responses", post(handlers::handle_responses))
-            // Grok Build uses the Responses protocol but has an independent
-            // provider namespace and failover queue.
-            .route(
-                "/grokbuild/v1/responses",
-                post(handlers::handle_grokbuild_responses),
-            )
-            // OpenAI Responses Compact API (Codex CLI 远程压缩，透传)
-            .route(
-                "/responses/compact",
-                post(handlers::handle_responses_compact),
-            )
-            .route(
-                "/v1/responses/compact",
-                post(handlers::handle_responses_compact),
-            )
-            .route(
-                "/v1/v1/responses/compact",
-                post(handlers::handle_responses_compact),
-            )
-            .route(
-                "/codex/v1/responses/compact",
-                post(handlers::handle_responses_compact),
-            )
-            .route(
-                "/grokbuild/v1/responses/compact",
-                post(handlers::handle_grokbuild_responses_compact),
-            )
-            // Gemini API (支持带前缀和不带前缀)
-            //
-            // 用 `any(..)` 覆盖所有 HTTP 方法：除了 POST `:generateContent` /
-            // `:streamGenerateContent` / `:countTokens` 之外，Gemini SDK / CLI 还会发
-            // GET `/models`、GET `/models/<id>` 等只读端点。如果只挂 POST，这些 GET
-            // 请求会在路由层 404，绕过本地代理的统计、整流和故障转移。
-            .route("/v1beta/*path", any(handlers::handle_gemini))
-            .route("/gemini/v1beta/*path", any(handlers::handle_gemini))
-            // Gemini 的 GA 版本也叫 /v1，给原 SDK 留一条出口
-            .route("/gemini/v1/*path", any(handlers::handle_gemini))
-            // 提高默认请求体大小限制（避免 413 Payload Too Large）
-            .layer(DefaultBodyLimit::max(200 * 1024 * 1024))
-            .with_state(self.state.clone())
-    }
-
-    /// 在不重启服务的情况下更新运行时配置
-    pub async fn apply_runtime_config(&self, config: &ProxyConfig) {
-        *self.state.config.write().await = config.clone();
-    }
-
-    /// 热更新熔断器配置
-    ///
-    /// 将新配置应用到所有已创建的熔断器实例
-    pub async fn update_circuit_breaker_configs(
-        &self,
-        config: super::circuit_breaker::CircuitBreakerConfig,
-    ) {
-        self.state.provider_router.update_all_configs(config).await;
-    }
-
-    pub async fn update_circuit_breaker_config_for_app(
-        &self,
-        app_type: &str,
-        config: super::circuit_breaker::CircuitBreakerConfig,
-    ) {
-        self.state
-            .provider_router
-            .update_app_configs(app_type, config)
-            .await;
-    }
-
-    /// 重置指定 Provider 的熔断器
-    pub async fn reset_provider_circuit_breaker(&self, provider_id: &str, app_type: &str) {
-        self.state
-            .provider_router
-            .reset_provider_breaker(provider_id, app_type)
-            .await;
+    #[tokio::test]
+    async fn repeated_start_and_stop_share_one_listener() {
+        let _guard = GATEWAY_TEST_LOCK.lock().await;
+        let db = Arc::new(Database::memory().unwrap());
+        // Reserve an ephemeral port, then let the gateway bind it.
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        db.set_setting("qoder_listen_port", &port.to_string())
+            .unwrap();
+        let gateway = Arc::new(Gateway::new(db));
+        assert!(gateway.start().await.unwrap().running);
+        assert!(gateway.start().await.unwrap().running);
+        let client = reqwest::Client::new();
+        let root = format!("http://127.0.0.1:{port}");
+        assert_eq!(
+            client
+                .get(format!("{root}/health"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            200
+        );
+        assert_eq!(
+            client
+                .post(format!("{root}/v1/messages"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            404
+        );
+        let response = client
+            .post(format!("{root}/qoder/v1/chat/completions"))
+            .json(&json!({"model":"missing","messages":[]}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 401);
+        gateway.stop().await;
+        assert!(!gateway.status().await.unwrap().running);
+        gateway.stop().await;
     }
 }
