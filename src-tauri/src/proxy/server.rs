@@ -167,9 +167,13 @@ async fn chat(
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Both fixtures export the process-wide model manifest. Serialize their
+    // lifecycle so one empty fixture cannot replace the other's route catalog.
+    static GATEWAY_TEST_LOCK: Mutex<()> = Mutex::const_new(());
 
     #[tokio::test]
     async fn native_route_rewrites_model_and_auth_and_rejects_disabled_models() {
+        let _guard = GATEWAY_TEST_LOCK.lock().await;
         let captured = Arc::new(Mutex::new(Vec::<Value>::new()));
         let sink = captured.clone();
         let upstream = Router::new().route("/v1/chat/completions", post(move |headers: HeaderMap, Json(body): Json<Value>| {
@@ -252,6 +256,7 @@ mod tests {
     }
     #[tokio::test]
     async fn repeated_start_and_stop_share_one_listener() {
+        let _guard = GATEWAY_TEST_LOCK.lock().await;
         let db = Arc::new(Database::memory().unwrap());
         // Reserve an ephemeral port, then let the gateway bind it.
         let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
