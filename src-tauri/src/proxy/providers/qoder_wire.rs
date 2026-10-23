@@ -962,7 +962,11 @@ impl AnthropicSseTranslator {
                         // tool_use so the next turn can replay it in order.
                         if !id.is_empty() {
                             if let Some(thinking) = self.pending_thinking.clone() {
-                                bridge_record_thinking(session_id, &[id.clone()], thinking);
+                                bridge_record_thinking(
+                                    session_id,
+                                    std::slice::from_ref(&id),
+                                    thinking,
+                                );
                             }
                         }
                         out.push(sse_data_frame(&self.chunk(

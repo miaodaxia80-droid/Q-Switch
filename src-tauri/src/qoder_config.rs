@@ -8,8 +8,10 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 
+mod native;
+pub use native::{remove_native_provider, sync_native_provider};
+
 const QODER_CARRIER_MAPPINGS_SETTING: &str = "qoder_carrier_mappings_v1";
-const QODER_TOOL_POLICY_SETTING: &str = "qoder_tool_policy_v1";
 /// Custom MODELS (one provider owns many models).
 const QODER_CUSTOM_ROUTES_SETTING: &str = "qoder_custom_routes_v1";
 /// Custom PROVIDERS (shared base URL / key / API format for many models).
@@ -141,63 +143,6 @@ fn legacy_provider_id_for_route(route_id: &str) -> String {
     format!("qswitch-custom-{route_id}")
 }
 
-/// Capabilities offered to a Qoder session that is routed through Qswitch.
-///
-/// These are deliberately opt-in. A routed model is an external authority,
-/// so exposing a tool in its OpenAI `tools` list is equivalent to granting it
-/// the capability. Read-only workspace inspection remains available by
-/// default; side-effecting tools require the local Qswitch user to enable
-/// them explicitly in the Qoder panel.
-#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct QoderToolPolicy {
-    pub allow_terminal: bool,
-    pub allow_write: bool,
-    pub allow_network: bool,
-    pub allow_private_network: bool,
-    pub allow_mcp: bool,
-}
-
-pub fn get_qoder_tool_policy(db: &Database) -> Result<QoderToolPolicy, AppError> {
-    let Some(raw) = db.get_setting(QODER_TOOL_POLICY_SETTING)? else {
-        return Ok(QoderToolPolicy::default());
-    };
-    serde_json::from_str(&raw)
-        .map_err(|error| AppError::Config(format!("Parse Qoder tool policy failed: {error}")))
-}
-
-pub fn save_qoder_tool_policy(
-    db: &Database,
-    policy: &QoderToolPolicy,
-) -> Result<QoderToolPolicy, AppError> {
-    // A private-network grant is meaningless without the enclosing network
-    // grant. Normalize it here so the stored policy has one unambiguous form.
-    let mut normalized = policy.clone();
-    if !normalized.allow_network {
-        normalized.allow_private_network = false;
-    }
-    let raw = serde_json::to_string(&normalized).map_err(|error| {
-        AppError::Config(format!("Serialize Qoder tool policy failed: {error}"))
-    })?;
-    db.set_setting(QODER_TOOL_POLICY_SETTING, &raw)?;
-    Ok(normalized)
-}
-
-/// Qoder's local Agent coordination directory.
-///
-/// Qoder's native Agent publishes `.info.json` here so the Electron main
-/// process can discover its local coordination socket.
-pub fn get_qoder_dir() -> PathBuf {
-    dirs::config_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("Qoder")
-        .join("SharedClientCache")
-}
-
-pub fn get_qoder_info_path() -> PathBuf {
-    get_qoder_dir().join(".info.json")
-}
-
 pub fn get_qoder_model_manifest_path() -> PathBuf {
     get_app_config_dir().join("qoder-models.json")
 }
@@ -226,8 +171,7 @@ pub(crate) struct QoderModelManifestEntry {
     base_url: String,
     #[serde(rename = "type")]
     protocol_type: String,
-    /// The loopback router is ready, but Qoder still needs a native transport
-    /// adapter before it can send its Agent request to `base_url`.
+    /// Native provider registration points Qoder at the loopback router.
     transport_status: String,
     #[serde(rename = "max_input_tokens")]
     max_input_tokens: u64,
@@ -361,52 +305,6 @@ pub fn list_qoder_carrier_mappings(db: &Database) -> Result<Vec<QoderCarrierMapp
     Ok(mappings)
 }
 
-pub fn save_qoder_carrier_mapping(
-    db: &Database,
-    carrier_model_id: &str,
-    route_id: &str,
-) -> Result<QoderCarrierMapping, AppError> {
-    let mapping = QoderCarrierMapping {
-        carrier_model_id: normalized_nonempty_qoder_custom_id(carrier_model_id)?,
-        route_id: normalized_nonempty_qoder_custom_id(route_id)?,
-    };
-    if mapping.carrier_model_id.starts_with("qswitch_") {
-        return Err(AppError::Config(
-            "A Q Switch route ID cannot be used as a Qoder carrier model ID.".to_string(),
-        ));
-    }
-    if !mapping.route_id.starts_with("qswitch_") {
-        return Err(AppError::Config(
-            "Qoder carrier mappings must point to a Q Switch route ID.".to_string(),
-        ));
-    }
-    if resolve_qoder_route(&mapping.route_id)?.is_none() {
-        return Err(AppError::Config(
-            "Unknown Q Switch route. Refresh the Qoder route catalog first.".to_string(),
-        ));
-    }
-
-    let mut mappings = list_qoder_carrier_mappings(db)?;
-    mappings.retain(|entry| entry.carrier_model_id != mapping.carrier_model_id);
-    mappings.push(mapping.clone());
-    mappings.sort_by(|left, right| left.carrier_model_id.cmp(&right.carrier_model_id));
-    let serialized = serde_json::to_string(&mappings).map_err(|error| {
-        AppError::Config(format!("Serialize Qoder carrier mappings failed: {error}"))
-    })?;
-    db.set_setting(QODER_CARRIER_MAPPINGS_SETTING, &serialized)?;
-    Ok(mapping)
-}
-
-pub fn remove_qoder_carrier_mapping(db: &Database, carrier_model_id: &str) -> Result<(), AppError> {
-    let carrier_model_id = normalized_nonempty_qoder_custom_id(carrier_model_id)?;
-    let mut mappings = list_qoder_carrier_mappings(db)?;
-    mappings.retain(|entry| entry.carrier_model_id != carrier_model_id);
-    let serialized = serde_json::to_string(&mappings).map_err(|error| {
-        AppError::Config(format!("Serialize Qoder carrier mappings failed: {error}"))
-    })?;
-    db.set_setting(QODER_CARRIER_MAPPINGS_SETTING, &serialized)
-}
-
 fn listed_qoder_custom_routes(db: &Database) -> Result<Vec<QoderCustomRoute>, AppError> {
     let Some(raw) = db.get_setting(QODER_CUSTOM_ROUTES_SETTING)? else {
         return Ok(Vec::new());
@@ -487,7 +385,7 @@ fn sync_custom_provider_mirror(
     }
     let catalog: Vec<Value> = models
         .iter()
-        .filter(|model| model.enabled)
+        .filter(|model| provider.enabled && model.enabled)
         .map(|model| {
             json!({
                 "model": model.model,
@@ -539,9 +437,9 @@ fn normalize_reasoning_effort(effort: Option<String>) -> Result<Option<String>, 
     match effort.as_deref().map(str::trim) {
         Some(value) if !value.is_empty() => {
             let lower = value.to_ascii_lowercase();
-            if !matches!(lower.as_str(), "low" | "medium" | "high") {
+            if !matches!(lower.as_str(), "low" | "medium" | "high" | "xhigh" | "max") {
                 return Err(AppError::Config(
-                    "reasoning_effort must be one of: low, medium, high".to_string(),
+                    "reasoning_effort must be one of: low, medium, high, xhigh, max".to_string(),
                 ));
             }
             Ok(Some(lower))
@@ -597,11 +495,6 @@ fn normalize_custom_provider(
         .as_deref()
         .map(str::trim)
         .is_some_and(|key| !key.is_empty());
-    if !provider.enabled {
-        provider.enabled = false;
-    } else {
-        provider.enabled = true;
-    }
     Ok(provider)
 }
 
@@ -795,7 +688,7 @@ pub async fn save_qoder_custom_provider(
     let mut providers = load_custom_providers_raw(db)?;
     let existing = providers
         .iter()
-        .find(|item| item.id == provider.id || (!provider.id.is_empty() && item.id == provider.id))
+        .find(|item| item.id == provider.id)
         .cloned();
     let normalized = normalize_custom_provider(provider, existing.as_ref())?;
     providers.retain(|item| item.id != normalized.id);
@@ -896,39 +789,6 @@ pub async fn delete_qoder_custom_route(db: &Database, id: &str) -> Result<(), Ap
     Ok(())
 }
 
-/// Resolve a direct `custom:qswitch_*` selection or an explicitly configured
-/// native Qoder carrier model into the route accepted by the loopback gateway.
-pub fn resolve_qoder_route_selection(
-    db: &Database,
-    model_id: &str,
-) -> Result<Option<QoderRouteSelection>, AppError> {
-    let normalized_model_id = normalized_nonempty_qoder_custom_id(model_id)?;
-    if resolve_qoder_route(&normalized_model_id)?.is_some() {
-        return Ok(Some(QoderRouteSelection {
-            route_id: normalized_model_id,
-            carrier_model_id: None,
-        }));
-    }
-
-    let mappings = list_qoder_carrier_mappings(db)?;
-    let Some(mapping) = mappings
-        .into_iter()
-        .find(|entry| entry.carrier_model_id == normalized_model_id)
-    else {
-        return Ok(None);
-    };
-    if resolve_qoder_route(&mapping.route_id)?.is_none() {
-        return Err(AppError::Config(
-            "Qoder carrier mapping refers to a missing Q Switch route. Refresh the route catalog or update the mapping."
-                .to_string(),
-        ));
-    }
-    Ok(Some(QoderRouteSelection {
-        route_id: mapping.route_id,
-        carrier_model_id: Some(mapping.carrier_model_id),
-    }))
-}
-
 pub async fn list_qoder_route_options(db: &Database) -> Result<Vec<QoderRouteOption>, AppError> {
     let manifest = match read_qoder_model_manifest()? {
         Some(manifest) => manifest,
@@ -958,8 +818,7 @@ pub async fn list_qoder_route_options(db: &Database) -> Result<Vec<QoderRouteOpt
     Ok(routes)
 }
 
-/// Export the non-secret Q Switch model catalog for the future native
-/// transport adapter.
+/// Export the non-secret Q Switch model catalog for native Qoder provider registration.
 ///
 /// The file contains only stable route IDs, upstream model names, and the local
 /// gateway URL. Provider credentials remain in the CC Switch database.
@@ -1088,7 +947,7 @@ pub async fn sync_qoder_model_manifest(db: &Database) -> Result<PathBuf, AppErro
                 display_name: format!("{} / {}", provider.name, display_name),
                 base_url: gateway_base_url.clone(),
                 protocol_type: "openai".to_string(),
-                transport_status: "native-adapter-required".to_string(),
+                transport_status: "native-provider".to_string(),
                 max_input_tokens,
                 is_reasoning,
                 reasoning_effort,
@@ -1110,9 +969,7 @@ pub async fn sync_qoder_model_manifest(db: &Database) -> Result<PathBuf, AppErro
     let manifest = QoderModelManifest { version: 3, models };
     let serialized = serde_json::to_vec_pretty(&manifest)
         .map_err(|e| AppError::Config(format!("Serialize Qoder model manifest failed: {e}")))?;
-    let temporary = path.with_extension("json.tmp");
-    fs::write(&temporary, serialized).map_err(|e| AppError::io(&temporary, e))?;
-    fs::rename(&temporary, &path).map_err(|e| AppError::io(&path, e))?;
+    crate::config::atomic_write(&path, &serialized)?;
 
     Ok(path)
 }
@@ -1120,11 +977,6 @@ pub async fn sync_qoder_model_manifest(db: &Database) -> Result<PathBuf, AppErro
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn info_path_is_inside_shared_client_cache() {
-        assert!(get_qoder_info_path().ends_with("Qoder/SharedClientCache/.info.json"));
-    }
 
     #[test]
     fn model_manifest_path_uses_qswitch_config_directory() {
@@ -1167,30 +1019,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn tool_policy_defaults_to_read_only_and_normalizes_private_network() {
-        let db = Database::memory().unwrap();
-        assert_eq!(
-            get_qoder_tool_policy(&db).unwrap(),
-            QoderToolPolicy::default()
-        );
-
-        let saved = save_qoder_tool_policy(
-            &db,
-            &QoderToolPolicy {
-                allow_terminal: true,
-                allow_write: true,
-                allow_network: false,
-                allow_private_network: true,
-                allow_mcp: true,
-            },
-        )
-        .unwrap();
-        assert!(saved.allow_terminal && saved.allow_write && saved.allow_mcp);
-        assert!(!saved.allow_private_network);
-        assert_eq!(get_qoder_tool_policy(&db).unwrap(), saved);
-    }
-
     fn test_provider(id: &str, format: &str) -> QoderCustomProvider {
         QoderCustomProvider {
             id: id.to_string(),
@@ -1225,7 +1053,7 @@ mod tests {
         let db = Database::memory().unwrap();
         let provider = test_provider("prov1", QODER_API_FORMAT_ANTHROPIC);
         let model = test_model("prov1", "model1", "claude-upstream");
-        sync_custom_provider_mirror(&db, &provider, &[model.clone()]).unwrap();
+        sync_custom_provider_mirror(&db, &provider, std::slice::from_ref(&model)).unwrap();
 
         let hidden = db
             .get_provider_by_id(&provider_id_for_custom_provider("prov1"), "qoder")
@@ -1251,10 +1079,36 @@ mod tests {
     }
 
     #[test]
+    fn disabled_custom_provider_exports_no_models() {
+        let db = Database::memory().unwrap();
+        let mut provider = test_provider("disabled", QODER_API_FORMAT_OPENAI_CHAT);
+        provider.enabled = false;
+        let model = test_model("disabled", "m", "upstream");
+        sync_custom_provider_mirror(&db, &provider, &[model]).unwrap();
+        let hidden = db
+            .get_provider_by_id(&provider_id_for_custom_provider("disabled"), "qoder")
+            .unwrap()
+            .unwrap();
+        assert_eq!(hidden.settings_config["modelCatalog"]["models"], json!([]));
+    }
+
+    #[test]
+    fn qoder_effort_accepts_native_cli_levels() {
+        for level in ["low", "medium", "high", "xhigh", "max"] {
+            assert_eq!(
+                normalize_reasoning_effort(Some(level.into()))
+                    .unwrap()
+                    .as_deref(),
+                Some(level)
+            );
+        }
+    }
+
+    #[test]
     fn custom_model_list_round_trips_through_settings() {
         let db = Database::memory().unwrap();
         let model = test_model("prov1", "model_list", "gpt-list-test");
-        store_qoder_custom_routes(&db, &[model.clone()]).unwrap();
+        store_qoder_custom_routes(&db, std::slice::from_ref(&model)).unwrap();
         let listed = listed_qoder_custom_routes(&db).unwrap();
         assert_eq!(listed, vec![model]);
     }
@@ -1404,7 +1258,7 @@ mod tests {
             display_name: "Provider A / Upstream".to_string(),
             base_url: "http://127.0.0.1:15731/qoder/v1".to_string(),
             protocol_type: "openai".to_string(),
-            transport_status: "native-adapter-required".to_string(),
+            transport_status: "native-provider".to_string(),
             max_input_tokens: 128_000,
             is_reasoning: false,
             reasoning_effort: None,
@@ -1433,7 +1287,7 @@ mod tests {
                 display_name: "Provider A / Upstream".to_string(),
                 base_url: "http://127.0.0.1:15731/qoder/v1".to_string(),
                 protocol_type: "openai".to_string(),
-                transport_status: "native-adapter-required".to_string(),
+                transport_status: "native-provider".to_string(),
                 max_input_tokens: 128_000,
                 is_reasoning: false,
                 reasoning_effort: None,
